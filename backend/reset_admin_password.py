@@ -14,9 +14,14 @@ async def reset_password():
         
     await db.users.update_one(
         {"email": email},
-        {"$set": {"password_hash": get_password_hash(password)}}
+        {"$set": {
+            "password_hash": get_password_hash(password),
+            "role": "super_admin",
+            "company_id": None,
+            "is_active": True,
+        }}
     )
-    print("Admin password reset successfully to 'admin'.")
+    print("Admin password reset to 'admin' (role=super_admin, company_id=None).")
 
 if __name__ == "__main__":
     asyncio.run(reset_password())

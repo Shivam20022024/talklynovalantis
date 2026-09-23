@@ -76,7 +76,8 @@ export default function CallsPage() {
       })
       alert('Selected calls deleted successfully!')
       setSelectedCalls([])
-      fetchCalls(1, true)
+      setPage(0)
+      loadCalls(0)
     } catch (e: any) {
       alert(`Failed to delete calls: ${e.message}`)
     }
@@ -138,7 +139,7 @@ export default function CallsPage() {
           ) : (
             <table className="w-full min-w-[780px] text-left">
               <thead>
-                <tr className="border-b border-border text-[11px] font-bold uppercase tracking-[0.14em] text-muted-foreground">
+                <tr className="border-b border-border h-12 text-sm font-bold uppercase tracking-wider text-foreground">
                   <th className="pb-3 pl-4 font-semibold w-[4%]">
                     <input 
                       type="checkbox" 

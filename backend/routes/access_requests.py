@@ -11,6 +11,11 @@ from auth import require_super_admin, get_password_hash
 
 access_requests_router = APIRouter()
 
+# Talkly's own access requests always carry a string `id`. The same Mongo
+# collection is also used by the unrelated hiring app (rows without `id`,
+# lowercase statuses) - scope every query to ours only.
+TALKLY_REQ = {"id": {"$exists": True}}
+
 def send_email(to_email: str, subject: str, body: str, html_body: str = None):
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.environ.get("SMTP_PORT", 587))
@@ -94,25 +99,25 @@ async def get_access_requests(
     current_user: dict = Depends(require_super_admin)
 ):
     db = mongodb.get_db()
-    
-    query = {}
+
+    query = dict(TALKLY_REQ)
     if status != "ALL":
         query["status"] = status
-        
+
     if search:
         query["$or"] = [
             {"company_name": {"$regex": search, "$options": "i"}},
             {"email": {"$regex": search, "$options": "i"}},
             {"contact_name": {"$regex": search, "$options": "i"}},
         ]
-        
+
     cursor = db.access_requests.find(query).sort("created_at", -1).skip(skip).limit(limit)
     requests = await cursor.to_list(length=limit)
-    
+
     # Format dates and _id
     for req in requests:
         req["_id"] = str(req["_id"])
-        
+
     total = await db.access_requests.count_documents(query)
     
     return {
@@ -124,9 +129,9 @@ async def get_access_requests(
 async def get_access_request_stats(current_user: dict = Depends(require_super_admin)):
     db = mongodb.get_db()
     
-    pending = await db.access_requests.count_documents({"status": "PENDING"})
-    approved = await db.access_requests.count_documents({"status": "APPROVED"})
-    rejected = await db.access_requests.count_documents({"status": "REJECTED"})
+    pending = await db.access_requests.count_documents({**TALKLY_REQ, "status": "PENDING"})
+    approved = await db.access_requests.count_documents({**TALKLY_REQ, "status": "APPROVED"})
+    rejected = await db.access_requests.count_documents({**TALKLY_REQ, "status": "REJECTED"})
     total_companies = await db.companies.count_documents({})
     
     return {
@@ -160,26 +165,32 @@ async def approve_access_request(req_id: str, current_user: dict = Depends(requi
         }}
     )
     
-    # 2. Create Company
+    now = datetime.utcnow()
+
+    # 2. Create Company (dedicated tenant, no Bolna agent yet - super admin sets it later)
     company_doc = {
         "company_id": company_id,
         "name": request["company_name"],
         "plan_type": "trial",
         "status": "ACTIVE",
-        "created_at": datetime.utcnow()
+        "bolna_agent_id": None,
+        "created_at": now,
+        "updated_at": now,
     }
     await db.companies.insert_one(company_doc)
-    
-    # 3. Create User (Active with Password)
+
+    # 3. Create the company admin user, bound to the new company_id.
     user_doc = {
         "user_id": user_id,
         "company_id": company_id,
         "name": request["contact_name"],
         "email": request["email"],
         "password_hash": request.get("password_hash", ""),
-        "role": "COMPANY_ADMIN",
+        "role": "company_admin",
+        "is_active": True,
         "status": "ACTIVE",
-        "created_at": datetime.utcnow()
+        "created_at": now,
+        "updated_at": now,
     }
     await db.users.insert_one(user_doc)
     

@@ -16,6 +16,8 @@ export default function PromptPage() {
   const [promptText, setPromptText] = useState("Loading...")
   const [welcomeMessage, setWelcomeMessage] = useState("Loading...")
   const [saving, setSaving] = useState(false)
+  const [publishing, setPublishing] = useState(false)
+  const [promptStatus, setPromptStatus] = useState<string>('Draft')
   const [showTestModal, setShowTestModal] = useState(false)
   const [testPhone, setTestPhone] = useState('')
 
@@ -27,6 +29,7 @@ export default function PromptPage() {
           if (data.prompt) setPromptText(data.prompt)
           if (data.welcome_message) setWelcomeMessage(data.welcome_message)
           else setWelcomeMessage("नमस्ते, मैं TalklyAI की तरफ से बोल रहा हूँ। आपकी property requirement के बारे में बात करने के लिए कॉल किया है। क्या अभी बात करना convenient है?")
+          if (data.prompt_status) setPromptStatus(data.prompt_status)
         }
       } catch (e) {
         console.error("Failed to load prompt")
@@ -42,11 +45,30 @@ export default function PromptPage() {
         method: 'POST',
         body: JSON.stringify({ prompt: promptText, welcome_message: welcomeMessage })
       })
-      alert("Prompt saved successfully!")
+      setPromptStatus('Draft')
+      alert("Draft saved.")
     } catch (e) {
       alert("Failed to save prompt.")
     } finally {
       setSaving(false)
+    }
+  }
+
+  const handlePublish = async () => {
+    if (!confirm('Publish this prompt to your company’s live AI agent?')) return
+    setPublishing(true)
+    try {
+      await fetchApi('/api/v1/prompt', {
+        method: 'POST',
+        body: JSON.stringify({ prompt: promptText, welcome_message: welcomeMessage })
+      })
+      const res = await fetchApi('/api/v1/prompt/publish', { method: 'POST', body: JSON.stringify({}) })
+      setPromptStatus('Published')
+      alert(res.bolna_synced ? 'Published and synced to your Bolna agent.' : 'Published (Bolna sync skipped — check agent config).')
+    } catch (e: any) {
+      alert(e.message || 'Failed to publish.')
+    } finally {
+      setPublishing(false)
     }
   }
 
@@ -81,8 +103,11 @@ export default function PromptPage() {
           <button onClick={() => setShowTestModal(true)} className="flex items-center gap-2 rounded-lg border border-border bg-card px-3.5 py-2.5 text-xs font-semibold hover:bg-muted">
             <Play size={15} />Test Agent
           </button>
-          <button onClick={handleSave} disabled={saving} className="flex items-center gap-2 rounded-lg bg-primary px-3.5 py-2.5 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/20 hover:opacity-90 disabled:opacity-50">
+          <button onClick={handleSave} disabled={saving} className="flex items-center gap-2 rounded-lg border border-border bg-card px-3.5 py-2.5 text-xs font-semibold hover:bg-muted disabled:opacity-50">
             <Save size={15} />{saving ? "Saving..." : "Save Draft"}
+          </button>
+          <button onClick={handlePublish} disabled={publishing} className="flex items-center gap-2 rounded-lg bg-primary px-3.5 py-2.5 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/20 hover:opacity-90 disabled:opacity-50">
+            <CheckCircle2 size={15} />{publishing ? "Publishing..." : "Publish"}
           </button>
         </div>
       </section>
@@ -94,8 +119,8 @@ export default function PromptPage() {
               <h2 className="text-lg font-bold">Agent Configuration</h2>
               <p className="mt-1 text-xs text-muted-foreground">Setup the welcome message and system prompt for your agent.</p>
             </div>
-            <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2 py-1 text-[10px] font-semibold text-emerald-700">
-              <CheckCircle2 size={12} />Published
+            <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[10px] font-semibold ${promptStatus === 'Published' ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`}>
+              <CheckCircle2 size={12} />{promptStatus === 'Published' ? 'Published' : 'Draft — not published'}
             </span>
           </div>
 

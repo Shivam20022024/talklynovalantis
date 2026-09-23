@@ -27,9 +27,12 @@ async def create_inbound_session(phone_number: str, call_id: str = None) -> dict
     doc["_id"] = None
     return doc
 
-async def get_inbound_session(call_id: str) -> dict:
+async def get_inbound_session(call_id: str, company_id: str = None) -> dict:
     db = mongodb.get_db()
-    return await db.calls.find_one({"call_id": call_id, "direction": "inbound"})
+    query = {"call_id": call_id, "direction": "inbound"}
+    if company_id:
+        query["company_id"] = company_id
+    return await db.calls.find_one(query)
 
 async def update_inbound_session(call_id: str, updates: dict):
     db = mongodb.get_db()
@@ -39,9 +42,12 @@ async def update_inbound_session(call_id: str, updates: dict):
         {"$set": updates}
     )
 
-async def get_all_inbound_calls(limit: int = 20, skip: int = 0):
+async def get_all_inbound_calls(limit: int = 20, skip: int = 0, company_id: str = None):
     db = mongodb.get_db()
-    cursor = db.calls.find({"direction": "inbound"}).sort("created_at", -1).skip(skip).limit(limit)
+    query = {"direction": "inbound"}
+    if company_id:
+        query["company_id"] = company_id
+    cursor = db.calls.find(query).sort("created_at", -1).skip(skip).limit(limit)
     calls = []
     async for d in cursor:
         d["_id"] = None

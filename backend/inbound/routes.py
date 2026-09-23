@@ -16,7 +16,7 @@ class PurchaseRequest(BaseModel):
 class WebhookRequest(BaseModel):
     webhook_url: str
 
-from auth import get_current_user, require_company_admin
+from auth import get_current_user, require_company_admin, require_company_access, tenant_filter
 import mongodb
 import datetime
 
@@ -24,10 +24,10 @@ import datetime
 
 
 @inbound_router.get("/numbers")
-async def get_numbers(current_user: dict = Depends(get_current_user)):
+async def get_numbers(current_user: dict = Depends(require_company_access)):
     db = mongodb.get_db()
     numbers = []
-    cursor = db.phone_numbers.find({"company_id": current_user["company_id"]})
+    cursor = db.phone_numbers.find(tenant_filter(current_user))
     async for num in cursor:
         num["_id"] = str(num["_id"])
         numbers.append(num)
@@ -84,24 +84,33 @@ async def inbound_webhook(request: Request):
     return Response(content=twiml_response, media_type="application/xml")
 
 @inbound_router.get("/calls")
-async def get_calls(limit: int = 20, skip: int = 0):
-    calls = await get_all_inbound_calls(limit=limit, skip=skip)
+async def get_calls(limit: int = 20, skip: int = 0, current_user: dict = Depends(require_company_access)):
+    calls = await get_all_inbound_calls(limit=limit, skip=skip, company_id=current_user["company_id"])
     return {"status": "success", "calls": calls}
 
 @inbound_router.get("/{id}")
-async def get_call(id: str):
-    call = await get_inbound_session(id)
+async def get_call(id: str, current_user: dict = Depends(require_company_access)):
+    call = await get_inbound_session(id, company_id=current_user["company_id"])
     if call:
         call["_id"] = None
         return {"status": "success", "call": call}
     return {"status": "error", "message": "Not found"}
 
+async def _assert_owns_inbound(id: str, current_user: dict):
+    db = mongodb.get_db()
+    call = await db.calls.find_one(tenant_filter(current_user, {"call_id": id}))
+    if not call:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Call not found")
+
 @inbound_router.post("/{id}/transfer")
-async def transfer(id: str, request: TransferRequest):
+async def transfer(id: str, request: TransferRequest, current_user: dict = Depends(require_company_access)):
+    await _assert_owns_inbound(id, current_user)
     result = await transfer_call(id, request.destination_number)
     return result
 
 @inbound_router.post("/{id}/hangup")
-async def hangup(id: str):
+async def hangup(id: str, current_user: dict = Depends(require_company_access)):
+    await _assert_owns_inbound(id, current_user)
     result = await hangup_call(id)
     return result

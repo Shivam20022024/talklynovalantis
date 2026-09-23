@@ -27,7 +27,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Form, BackgroundTasks, Depends
-from auth import get_current_user
+from auth import (
+    require_company_access,
+    tenant_filter,
+    enforce_no_foreign_company,
+)
 from routes.auth_routes import auth_router
 from fastapi.middleware.cors import CORSMiddleware
 import io
@@ -73,17 +77,22 @@ from routes.campaign_routes import campaign_router
 from routes.lead_routes import lead_router
 from routes.auth_routes import auth_router
 from routes.billing_routes import billing_router
-from routes.super_admin_routes import super_admin_router
+from routes.admin_routes import admin_router
+from routes.agent_routes import agent_router
 from routes.access_requests import access_requests_router
 from inbound.routes import inbound_router
 
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["Auth"])
 app.include_router(billing_router, prefix="/api/v1/billing", tags=["Billing"])
-app.include_router(super_admin_router, prefix="/api/v1/super-admin", tags=["Super Admin"])
+# Super-admin platform APIs. Mounted at /admin (canonical) and /super-admin (legacy alias).
+app.include_router(admin_router, prefix="/api/v1/admin", tags=["Super Admin"])
+app.include_router(admin_router, prefix="/api/v1/super-admin", tags=["Super Admin (legacy)"])
 app.include_router(campaign_router, prefix="/api/v1", tags=["Campaigns"])
 app.include_router(lead_router, prefix="/api/v1", tags=["Leads"])
+app.include_router(agent_router, prefix="/api/v1", tags=["Agent"])
 app.include_router(inbound_router, prefix="/api/v1/inbound")
 app.include_router(access_requests_router, prefix="/api/v1/access-requests")
+app.include_router(access_requests_router, prefix="/api/v1/admin/access-requests")
 
 from services.billing_service import billing_service
 @app.get("/")
@@ -92,59 +101,151 @@ async def health_check():
     return {"status": "ok", "service": "TalklyAI Backend"}
 
 @app.get("/api/v1/analytics/dashboard")
-async def get_analytics_dashboard(range: str = "30 Days", campaign_id: str = None, current_user: dict = Depends(get_current_user)):
+async def get_analytics_dashboard(range: str = "30 Days", campaign_id: str = None, current_user: dict = Depends(require_company_access)):
     db = mongodb.get_db()
     metrics = await intelligence_service.get_dashboard_metrics(db, current_user["company_id"], range, campaign_id)
     return {"status": "success", "data": metrics}
 
 @app.get("/api/v1/analytics/overall")
-async def get_overall_analytics(current_user: dict = Depends(get_current_user)):
+async def get_overall_analytics(current_user: dict = Depends(require_company_access)):
     db = mongodb.get_db()
     metrics = await intelligence_service.get_overall_dashboard_metrics(db, current_user["company_id"])
     return {"status": "success", "data": metrics}
 
 @app.get("/api/v1/customers/{customer_id}/timeline")
-async def get_customer_timeline(customer_id: str, current_user: dict = Depends(get_current_user)):
+async def get_customer_timeline(customer_id: str, current_user: dict = Depends(require_company_access)):
     db = mongodb.get_db()
     timeline = await intelligence_service.get_customer_timeline(db, customer_id, current_user["company_id"])
     return {"status": "success", "data": timeline}
 
-@app.get("/api/v1/prompt")
-async def get_prompt(current_user: dict = Depends(get_current_user)):
-    db = mongodb.get_db()
-    doc = await db.prompts.find_one({"company_id": current_user["company_id"]})
-    if doc:
+
+DEFAULT_PROMPT = "You are an AI sales agent for TalklyAI. You MUST speak entirely in English. Be polite and qualify the lead by asking if they are looking for a 2BHK or 3BHK apartment."
+DEFAULT_WELCOME = "Hi, this is TalklyAI. How can I help you today?"
+
+
+def _effective_prompt(doc: dict | None):
+    """Prompt actually used for live calls: published, then draft, then legacy flat field."""
+    if not doc:
+        return None, None
+    prompt = doc.get("published_prompt") or doc.get("draft_prompt") or doc.get("prompt")
+    welcome = doc.get("published_welcome_message") or doc.get("draft_welcome_message") or doc.get("welcome_message")
+    return prompt, welcome
+
+
+def _prompt_view(doc: dict | None) -> dict:
+    """Present a prompt doc, tolerating the legacy flat {prompt, welcome_message} shape."""
+    if not doc:
         return {
-            "status": "success", 
-            "prompt": doc.get("prompt"),
-            "welcome_message": doc.get("welcome_message")
+            "status": "success",
+            "prompt": DEFAULT_PROMPT,
+            "welcome_message": DEFAULT_WELCOME,
+            "published_prompt": None,
+            "published_welcome_message": None,
+            "prompt_status": "Draft",
         }
+    draft = doc.get("draft_prompt") or doc.get("prompt")
+    draft_welcome = doc.get("draft_welcome_message") or doc.get("welcome_message")
+    published = doc.get("published_prompt") or doc.get("prompt")
+    published_welcome = doc.get("published_welcome_message") or doc.get("welcome_message")
     return {
-        "status": "success", 
-        "prompt": "You are an AI sales agent for TalklyAI. You MUST speak entirely in English. Be polite and qualify the lead by asking if they are looking for a 2BHK or 3BHK apartment.",
-        "welcome_message": "Hi, this is TalklyAI. How can I help you today?"
+        "status": "success",
+        "prompt": draft or published or DEFAULT_PROMPT,
+        "welcome_message": draft_welcome or published_welcome or DEFAULT_WELCOME,
+        "published_prompt": published,
+        "published_welcome_message": published_welcome,
+        "prompt_status": doc.get("status", "Published" if published else "Draft"),
+        "published_at": doc.get("published_at"),
     }
 
+
+@app.get("/api/v1/prompt")
+async def get_prompt(current_user: dict = Depends(require_company_access)):
+    db = mongodb.get_db()
+    doc = await db.prompts.find_one({"company_id": current_user["company_id"]})
+    return _prompt_view(doc)
+
 @app.post("/api/v1/prompt")
-async def save_prompt(payload: dict = Body(...), current_user: dict = Depends(get_current_user)):
+async def save_prompt(payload: dict = Body(...), current_user: dict = Depends(require_company_access)):
+    enforce_no_foreign_company(current_user, payload)
     db = mongodb.get_db()
     prompt = payload.get("prompt")
     welcome_message = payload.get("welcome_message")
     await db.prompts.update_one(
         {"company_id": current_user["company_id"]},
-        {"$set": {"prompt": prompt, "welcome_message": welcome_message}},
+        {"$set": {
+            "draft_prompt": prompt,
+            "draft_welcome_message": welcome_message,
+            "status": "Draft",
+            "updated_at": datetime.utcnow(),
+        }},
         upsert=True
     )
     return {"status": "success"}
+
+
+@app.post("/api/v1/prompt/publish")
+async def publish_prompt(payload: dict | None = Body(None), current_user: dict = Depends(require_company_access)):
+    payload = payload or {}
+    enforce_no_foreign_company(current_user, payload)
+    db = mongodb.get_db()
+    company_id = current_user["company_id"]
+
+    doc = await db.prompts.find_one({"company_id": company_id})
+    prompt = (payload or {}).get("prompt") or (doc or {}).get("draft_prompt") or (doc or {}).get("prompt")
+    welcome = (payload or {}).get("welcome_message") or (doc or {}).get("draft_welcome_message") or (doc or {}).get("welcome_message")
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Nothing to publish - save a draft first")
+
+    company = await db.companies.find_one({"company_id": company_id})
+    agent_id = (company or {}).get("bolna_agent_id")
+    if not agent_id:
+        raise HTTPException(
+            status_code=400,
+            detail="This company has no dedicated Bolna agent configured. Ask an administrator to set companies.bolna_agent_id.",
+        )
+
+    # Push the published prompt to THIS company's Bolna agent only.
+    api_key = os.environ.get("BOLNA_API_KEY", "").strip()
+    bolna_synced = False
+    if api_key:
+        try:
+            resp = await run_in_threadpool(
+                requests.patch,
+                f"https://api.bolna.ai/agent/{agent_id}",
+                json={"agent_prompts": {"task_1": {"system_prompt": prompt}},
+                      "agent_config": {"agent_welcome_message": welcome or ""}},
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                timeout=30,
+            )
+            bolna_synced = resp.ok
+            if not resp.ok:
+                print(f"Bolna agent update failed for company {company_id}: {resp.status_code} {resp.text[:200]}")
+        except Exception as e:
+            print(f"Bolna agent update error for company {company_id}: {e}")
+
+    await db.prompts.update_one(
+        {"company_id": company_id},
+        {"$set": {
+            "published_prompt": prompt,
+            "published_welcome_message": welcome,
+            "draft_prompt": prompt,
+            "draft_welcome_message": welcome,
+            "status": "Published",
+            "published_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }},
+        upsert=True,
+    )
+    return {"status": "success", "bolna_synced": bolna_synced, "agent_id": agent_id}
 
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 
 # Startup logic moved to lifespan context manager above
 
 @app.get("/api/v1/calls")
-async def get_calls(limit: int = 20, skip: int = 0, current_user: dict = Depends(get_current_user)):
+async def get_calls(limit: int = 20, skip: int = 0, current_user: dict = Depends(require_company_access)):
     db = mongodb.get_db()
-    cursor = db.calls.find({"company_id": current_user["company_id"]}).sort("created_at", -1).skip(skip).limit(limit)
+    cursor = db.calls.find(tenant_filter(current_user)).sort("created_at", -1).skip(skip).limit(limit)
     calls = []
     async for d in cursor:
         d["_id"] = None
@@ -152,35 +253,33 @@ async def get_calls(limit: int = 20, skip: int = 0, current_user: dict = Depends
     return calls
 
 @app.delete("/api/v1/calls")
-async def delete_all_calls(current_user: dict = Depends(get_current_user)):
+async def delete_all_calls(current_user: dict = Depends(require_company_access)):
     db = mongodb.get_db()
-    result = await db.calls.delete_many({"company_id": current_user["company_id"]})
+    result = await db.calls.delete_many(tenant_filter(current_user))
     return {"status": "success", "deleted_count": result.deleted_count}
 
 @app.post("/api/v1/calls/delete-bulk")
-async def delete_bulk_calls(payload: dict = Body(...), current_user: dict = Depends(get_current_user)):
+async def delete_bulk_calls(payload: dict = Body(...), current_user: dict = Depends(require_company_access)):
     db = mongodb.get_db()
     call_ids = payload.get("call_ids", [])
     if not call_ids:
         return {"status": "success", "deleted_count": 0}
-    
-    result = await db.calls.delete_many({
-        "company_id": current_user["company_id"],
-        "call_id": {"$in": call_ids}
-    })
+
+    result = await db.calls.delete_many(tenant_filter(current_user, {"call_id": {"$in": call_ids}}))
     return {"status": "success", "deleted_count": result.deleted_count}
 
 @app.get("/api/v1/calls/{call_id}")
-async def get_call(call_id: str, current_user: dict = Depends(get_current_user)):
+async def get_call(call_id: str, current_user: dict = Depends(require_company_access)):
     db = mongodb.get_db()
-    doc = await db.calls.find_one({"call_id": call_id, "company_id": current_user["company_id"]})
+    doc = await db.calls.find_one(tenant_filter(current_user, {"call_id": call_id}))
     if not doc:
         raise HTTPException(status_code=404, detail="Call not found")
     doc["_id"] = None
     return doc
 
 @app.post("/api/v1/calls/trigger")
-async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Depends(get_current_user)):
+async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Depends(require_company_access)):
+    enforce_no_foreign_company(current_user, payload)
     phone_number = str(payload.get("phone_number", "")).replace(" ", "").replace("-", "").replace("(", "").replace(")", "").strip()
     if phone_number and not phone_number.startswith("+"):
         if len(phone_number) == 10 and phone_number.isdigit():
@@ -200,25 +299,27 @@ async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Dep
     
     db = mongodb.get_db()
     
-    # Fetch real customer name if lead exists
+    # Fetch real customer name if lead exists (scoped to this company)
     customer_name = "Phone Lead"
     if lead_id and not lead_id.startswith("test-agent-call-"):
-        # The lead_id could be the custom ID or ObjectId string, but typically leads have a `lead_id`
-        lead = await db.leads.find_one({"lead_id": payload.get("lead_id")})
+        lead = await db.leads.find_one(tenant_filter(current_user, {"lead_id": payload.get("lead_id")}))
         if not lead:
             try:
                 from bson import ObjectId
-                lead = await db.leads.find_one({"_id": ObjectId(payload.get("lead_id"))})
-            except:
+                lead = await db.leads.find_one(tenant_filter(current_user, {"_id": ObjectId(payload.get("lead_id"))}))
+            except Exception:
                 pass
         if lead and lead.get("name"):
             customer_name = lead.get("name").strip()
-    
-    # 2. Dynamically fetch Agent ID based on Database mapping
-    agent_id = await language_service.get_agent_id_for_language(db, campaign_language, current_user["company_id"])
+
+    # 2. Resolve this company's dedicated Bolna agent (never a shared global agent in strict mode)
+    try:
+        agent_id = await language_service.get_agent_id_for_language(db, campaign_language, current_user["company_id"])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     if not api_key or not agent_id:
-        raise HTTPException(status_code=400, detail="Bolna.ai API Key or Agent ID not configured")
+        raise HTTPException(status_code=400, detail="Bolna.ai API Key or Agent ID not configured for this company")
 
     
     # Always fetch latest BASE_URL to ensure it reflects current ngrok/tunnel
@@ -265,10 +366,11 @@ async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Dep
         }
     }
 
-    # Fetch custom prompt from DB
+    # Fetch custom prompt from DB (published prompt is what live calls use)
     prompt_doc = await db.prompts.find_one({"company_id": current_user["company_id"]})
-    base_prompt = prompt_doc.get("prompt") if prompt_doc else "You are an AI sales agent for TalklyAI. Be polite and helpful."
-    
+    _bp, _wm = _effective_prompt(prompt_doc)
+    base_prompt = _bp or "You are an AI sales agent for TalklyAI. Be polite and helpful."
+
     # Replace variables
     prompt_text = base_prompt.replace("{{customer_name}}", customer_name)
     company = await db.companies.find_one({"company_id": current_user["company_id"]})
@@ -281,8 +383,8 @@ async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Dep
         prompt_text += f"\n\nIMPORTANT: You MUST speak entirely in the {campaign_language} language. Please reply naturally in {campaign_language}."
 
     bolna_payload["user_data"]["system_prompt"] = prompt_text
-    
-    welcome_message = prompt_doc.get("welcome_message") if prompt_doc else None
+
+    welcome_message = _wm
     if welcome_message:
         welcome_text = welcome_message.replace("{{customer_name}}", customer_name)
         welcome_text = welcome_text.replace("{{company_name}}", company_name_val)
@@ -387,10 +489,11 @@ async def process_bulk_calls(contacts: list, campaign_language: str = "English",
             }
         }
 
-        # Fetch custom prompt from DB
+        # Fetch custom prompt from DB (published)
         prompt_doc = await db.prompts.find_one({"company_id": company_id})
-        base_prompt = prompt_doc.get("prompt") if prompt_doc else "You are an AI sales agent for TalklyAI. Be polite and helpful."
-        
+        _bp, _wm = _effective_prompt(prompt_doc)
+        base_prompt = _bp or "You are an AI sales agent for TalklyAI. Be polite and helpful."
+
         # Replace variables
         prompt_text = base_prompt.replace("{{customer_name}}", customer_name)
         company = await db.companies.find_one({"company_id": company_id})
@@ -405,7 +508,7 @@ async def process_bulk_calls(contacts: list, campaign_language: str = "English",
 
         bolna_payload["user_data"]["system_prompt"] = prompt_text
         
-        welcome_message = prompt_doc.get("welcome_message") if prompt_doc else None
+        welcome_message = _wm
         if welcome_message:
             welcome_text = welcome_message.replace("{{customer_name}}", customer_name)
             welcome_text = welcome_text.replace("{{company_name}}", company_name_val)
@@ -449,7 +552,7 @@ async def trigger_bolna_bulk(
     voice_gender: str = Form("Female"),
     regional_accent: str = Form("Default"),
     preview_only: bool = Form(False),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_company_access)
 ):
     if not file.filename.endswith(('.xlsx', '.xls', '.csv')):
         raise HTTPException(status_code=400, detail="Only .xlsx and .csv files are supported")
@@ -537,7 +640,7 @@ async def trigger_bolna_bulk(
 async def trigger_campaign_calls(
     background_tasks: BackgroundTasks,
     payload: dict = Body(...),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_company_access)
 ):
     campaign_ids = payload.get("campaign_ids", [])
     if not campaign_ids:
@@ -584,7 +687,7 @@ async def trigger_campaign_calls(
     }
 
 @app.post("/api/v1/calls/send-email")
-async def send_email(payload: dict = Body(...)):
+async def send_email(payload: dict = Body(...), current_user: dict = Depends(require_company_access)):
     to_email = payload.get("to")
     subject = payload.get("subject")
     body = payload.get("body")
@@ -773,14 +876,22 @@ async def bolna_webhook(data: dict = Body(...)):
             customer_phone = data.get("telephony_data", {}).get("from_number") or data.get("caller_phone_number") or "Unknown Inbound"
             lead_id = data.get("call_id") or data.get("execution_id") or f"inbound_{int(time.time()*1000)}"
             
-            # Resolve company_id from agent_id if possible
-            inbound_company_id = "novalantis-legacy-tenant" # fallback
+            # Resolve company_id from the Bolna agent that handled the call.
+            inbound_company_id = None
             agent_id = data.get("agent_id") or data.get("telephony_data", {}).get("agent_id")
             if agent_id:
                 mapping = await db.language_mappings.find_one({"bolna_agent_id": agent_id})
                 if mapping and mapping.get("company_id"):
                     inbound_company_id = mapping.get("company_id")
-            
+                if not inbound_company_id:
+                    company = await db.companies.find_one({"bolna_agent_id": agent_id})
+                    if company:
+                        inbound_company_id = company.get("company_id")
+            if not inbound_company_id:
+                # Unattributable inbound call - keep it but flag it for an admin.
+                inbound_company_id = os.environ.get("UNATTRIBUTED_INBOUND_COMPANY_ID") or "unassigned"
+                print(f"WARNING: inbound call {lead_id} could not be attributed to a company (agent_id={agent_id})")
+
             await db.calls.insert_one({
                 "call_id": lead_id,
                 "customer_id": customer_phone,
@@ -849,7 +960,7 @@ async def process_audio_api(
     agent_name: str = Form("AI Agent"),
     employee_id: str = Form(None),
     employee_email: str = Form(None),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_company_access)
 ):
     temp_path = None
     try:
@@ -889,7 +1000,7 @@ async def process_audio_api(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/voice-intelligence/history")
-async def get_voice_intelligence_history(limit: int = 20, skip: int = 0, current_user: dict = Depends(get_current_user)):
+async def get_voice_intelligence_history(limit: int = 20, skip: int = 0, current_user: dict = Depends(require_company_access)):
     db = mongodb.get_db()
     cursor = db.calls.find({
         "company_id": current_user["company_id"], 
@@ -928,32 +1039,45 @@ async def download_report(report_type: str):
 
 from services.crm_service import crm_service
 
+async def _get_owned_call(db, call_id: str, current_user: dict):
+    doc = await db.calls.find_one(tenant_filter(current_user, {"call_id": call_id}))
+    if not doc:
+        raise HTTPException(status_code=404, detail="Call not found")
+    return doc
+
+
 @app.post("/api/v1/calls/{call_id}/sync-crm")
-async def sync_call_to_crm(call_id: str):
+async def sync_call_to_crm(call_id: str, current_user: dict = Depends(require_company_access)):
     try:
         db = mongodb.get_db()
+        await _get_owned_call(db, call_id, current_user)
         await crm_service.sync_call_to_crm(db, call_id)
         return {"status": "success", "message": "Successfully synced to CRM."}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/v1/calls/{call_id}/send-followup")
-async def send_followup_email(call_id: str):
+async def send_followup_email(call_id: str, current_user: dict = Depends(require_company_access)):
     # Simulates sending an email
     try:
         db = mongodb.get_db()
+        await _get_owned_call(db, call_id, current_user)
         import asyncio
         await asyncio.sleep(1) # Simulate network delay
-        
-        # Mark email as sent in DB
+
+        # Mark email as sent in DB (scoped to this company)
         await db.calls.update_one(
-            {"call_id": call_id},
+            tenant_filter(current_user, {"call_id": call_id}),
             {"$set": {
                 "followup_sent": True,
                 "followup_sent_at": datetime.utcnow().isoformat()
             }}
         )
         return {"status": "success", "message": "Email sent successfully."}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Bot, Loader2 } from 'lucide-react';
-import { useAuth } from '@/components/providers/AuthProvider';
+import { useAuth, normalizeRole } from '@/components/providers/AuthProvider';
 import { fetchApi } from '@/lib/api';
 
 export default function LoginPage() {
@@ -28,7 +28,7 @@ export default function LoginPage() {
 
       if (data.access_token && data.user) {
         login(data.access_token, data.user);
-        router.push('/dashboard');
+        router.push(normalizeRole(data.user.role) === 'super_admin' ? '/admin' : '/dashboard');
       } else {
         throw new Error('Invalid response from server');
       }
@@ -91,6 +91,13 @@ export default function LoginPage() {
             {loading ? <Loader2 size={16} className="animate-spin" /> : 'Sign in'}
           </button>
         </form>
+
+        <p className="mt-6 text-center text-sm text-muted-foreground">
+          New company?{' '}
+          <a href="/request-access" className="font-semibold text-primary hover:underline">
+            Request access
+          </a>
+        </p>
       </div>
       <div className="mt-8 text-center text-sm text-muted-foreground font-medium">
         Made by Novalantis

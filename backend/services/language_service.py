@@ -1,5 +1,54 @@
+import os
 import re
+import logging
 from typing import Dict, Any, Optional
+
+logger = logging.getLogger("talkly.bolna")
+
+
+def _strict_bolna_enabled() -> bool:
+    return str(os.environ.get("STRICT_BOLNA_AGENT", "")).strip().lower() in ("1", "true", "yes", "on")
+
+
+async def resolve_bolna_agent_id(db, company_id: str, language: str = "English") -> str:
+    """Resolve the Bolna agent id to use for a company's call.
+
+    Resolution order (strict tenant isolation):
+      1. company-specific language mapping (``language_mappings`` with company_id)
+      2. ``companies.bolna_agent_id`` (the company's dedicated agent)
+      3. env ``BOLNA_AGENT_ID`` fallback - ONLY when ``STRICT_BOLNA_AGENT`` is not
+         enabled, and always with a loud warning. Never silently shared in strict mode.
+    """
+    if not company_id:
+        raise ValueError("company_id is required to resolve a Bolna agent")
+
+    mapping = await db.language_mappings.find_one({
+        "company_id": company_id,
+        "language": {"$regex": f"^{re.escape(language)}$", "$options": "i"},
+    })
+    if mapping and mapping.get("bolna_agent_id"):
+        return mapping["bolna_agent_id"]
+
+    mapping_en = await db.language_mappings.find_one({"company_id": company_id, "language": "English"})
+    if mapping_en and mapping_en.get("bolna_agent_id"):
+        return mapping_en["bolna_agent_id"]
+
+    company = await db.companies.find_one({"company_id": company_id})
+    if company and company.get("bolna_agent_id"):
+        return company["bolna_agent_id"]
+
+    if _strict_bolna_enabled():
+        raise ValueError(
+            f"No Bolna agent configured for company {company_id}. "
+            "Set companies.bolna_agent_id or a company language mapping."
+        )
+
+    fallback = os.environ.get("BOLNA_AGENT_ID", "").strip()
+    logger.warning(
+        "Bolna FALLBACK agent used for company %s (no company-specific agent configured)",
+        company_id,
+    )
+    return fallback
 
 class LanguageService:
     """
@@ -51,29 +100,9 @@ class LanguageService:
         return None
 
     async def get_agent_id_for_language(self, db, language: str, company_id: str = None) -> str:
+        """Resolve the Bolna agent id for a company + language.
+
+        Delegates to :func:`resolve_bolna_agent_id` which enforces per-company
+        isolation (no shared global agent unless STRICT_BOLNA_AGENT is off).
         """
-        Dynamically fetches the Bolna Agent ID for a requested language from the DB.
-        Falls back to English if not found.
-        """
-        import os
-        
-        query = {"language": {"$regex": f"^{language}$", "$options": "i"}}
-        if company_id:
-            query["company_id"] = company_id
-            
-        # 1. Query the database
-        mapping = await db.language_mappings.find_one(query)
-        if mapping and mapping.get("bolna_agent_id"):
-            return mapping["bolna_agent_id"]
-            
-        # 2. Fallback to English DB configuration
-        query_en = {"language": "English"}
-        if company_id:
-            query_en["company_id"] = company_id
-            
-        mapping_en = await db.language_mappings.find_one(query_en)
-        if mapping_en and mapping_en.get("bolna_agent_id"):
-            return mapping_en["bolna_agent_id"]
-            
-        # 3. Absolute fallback to env var
-        return os.environ.get("BOLNA_AGENT_ID", "").strip()
+        return await resolve_bolna_agent_id(db, company_id, language or "English")

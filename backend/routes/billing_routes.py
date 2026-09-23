@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 from typing import Dict, Any, List
 import mongodb
-from auth import get_current_user
+from auth import require_company_access as get_current_user
 from services.billing_service import billing_service
 from services.payment_provider import payment_provider
 

@@ -1,45 +1,51 @@
+"""Create (or repair) the single global super-admin account.
+
+Super admins are platform-level: role == "super_admin", company_id == None.
+Idempotent - safe to run repeatedly.
+"""
 import asyncio
+import os
 import uuid
 from datetime import datetime
 import mongodb
 from auth import get_password_hash
 
+ADMIN_EMAIL = os.environ.get("SUPER_ADMIN_EMAIL", "admin@talkly.ai")
+ADMIN_PASSWORD = os.environ.get("SUPER_ADMIN_PASSWORD", "admin")
+ADMIN_NAME = os.environ.get("SUPER_ADMIN_NAME", "Talkly Platform Admin")
+
+
 async def create_admin():
     db = mongodb.get_db()
-    
-    email = "admin@talkly.ai"
-    password = "admin"
-    company_name = "TalklyAI"
-    user_name = "Talkly Admin"
-    
-    existing = await db.users.find_one({"email": email})
+    now = datetime.utcnow()
+
+    existing = await db.users.find_one({"email": ADMIN_EMAIL})
     if existing:
-        print("Admin user already exists")
+        await db.users.update_one(
+            {"email": ADMIN_EMAIL},
+            {"$set": {
+                "role": "super_admin",
+                "company_id": None,
+                "is_active": True,
+                "updated_at": now,
+            }},
+        )
+        print(f"Repaired existing super admin {ADMIN_EMAIL} (role=super_admin, company_id=None)")
         return
-        
-    company_id = str(uuid.uuid4())
-    user_id = str(uuid.uuid4())
-    
-    company_doc = {
-        "company_id": company_id,
-        "name": company_name,
-        "plan_type": "enterprise",
-        "created_at": datetime.utcnow()
-    }
-    await db.companies.insert_one(company_doc)
-    
-    user_doc = {
-        "user_id": user_id,
-        "company_id": company_id,
-        "name": user_name,
-        "email": email,
-        "password_hash": get_password_hash(password),
+
+    await db.users.insert_one({
+        "user_id": str(uuid.uuid4()),
+        "name": ADMIN_NAME,
+        "email": ADMIN_EMAIL,
+        "password_hash": get_password_hash(ADMIN_PASSWORD),
         "role": "super_admin",
-        "created_at": datetime.utcnow()
-    }
-    await db.users.insert_one(user_doc)
-    
-    print(f"Created admin user {email} / {password} for company {company_name}")
+        "company_id": None,
+        "is_active": True,
+        "created_at": now,
+        "updated_at": now,
+    })
+    print(f"Created super admin {ADMIN_EMAIL} / {ADMIN_PASSWORD}")
+
 
 if __name__ == "__main__":
     asyncio.run(create_admin())
