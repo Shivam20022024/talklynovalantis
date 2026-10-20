@@ -26,13 +26,13 @@ const QuoteVisual = () => (
       transition={{ duration: 1, delay: 0.3 }}
       className="text-sm italic text-gray-500 leading-relaxed pl-4"
     >
-      I&apos;m looking for a 3BHK property in Gurgaon under 2 crore with modern amenities...
+      I&apos;m inquiring about your premium program details and would like to confirm my consultation schedule for this Friday...
     </motion.p>
   </div>
 );
 
 const TagsVisual = () => {
-  const tags = ['High Intent', '₹2 Cr Budget', 'Gurgaon', 'Ready to Move', '3BHK', 'Modern'];
+  const tags = ['High Intent', 'Verified Prospect', 'Urgent Timeline', 'Qualified Lead', 'Follow-up Set'];
   return (
     <div className="flex flex-wrap gap-1.5">
       {tags.map((tag, i) => (

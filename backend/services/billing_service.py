@@ -61,7 +61,7 @@ class BillingService:
         )
         return tx
 
-    async def process_call_billing(self, db, call_id: str, company_id: str, direction: str, duration_seconds: int, provider: str = "bolna"):
+    async def process_call_billing(self, db, call_id: str, company_id: str, direction: str, duration_seconds: float, provider: str = "bolna"):
         if duration_seconds <= 0:
             return None # No duration, no cost
             
@@ -70,11 +70,20 @@ class BillingService:
         if existing_usage:
             return existing_usage # Already billed
             
-        duration_minutes = max(1, (duration_seconds + 59) // 60) # round up to next minute
-        
+        duration_seconds = float(duration_seconds)
         pricing = DEFAULT_PRICING.get(direction, DEFAULT_PRICING["default"])
-        provider_cost = pricing["provider_cost"] * duration_minutes
-        customer_cost = pricing["customer_price"] * duration_minutes
+        
+        # Fair billing policy:
+        # 1. Under 5 seconds (immediate hangup / quick drop): FREE (₹0.00)
+        # 2. 5 seconds and above: Fair prorated per-second billing (₹12.00 / 60 = ₹0.20/second)
+        if duration_seconds < 5.0:
+            customer_cost = 0.0
+            provider_cost = 0.0
+            billed_minutes = 0.0
+        else:
+            customer_cost = round(duration_seconds * (pricing["customer_price"] / 60.0), 2)
+            provider_cost = round(duration_seconds * (pricing["provider_cost"] / 60.0), 2)
+            billed_minutes = round(duration_seconds / 60.0, 2)
         
         # Check active subscription first
         subscription = await db.company_subscriptions.find_one({
@@ -84,16 +93,13 @@ class BillingService:
         
         wallet = await self.get_or_create_wallet(db, company_id)
         
-        # We will deduct from wallet directly for now (simplified plan model for V1)
-        # In a full model, we'd check if subscription has remaining minutes and deduct from there first.
-        
         usage_record = {
             "id": str(uuid.uuid4()),
             "company_id": company_id,
             "call_id": call_id,
             "provider": provider,
             "duration_seconds": duration_seconds,
-            "billed_minutes": duration_minutes,
+            "billed_minutes": billed_minutes,
             "provider_cost": provider_cost,
             "customer_cost": customer_cost,
             "service_type": f"{direction}_call",
@@ -102,49 +108,53 @@ class BillingService:
         
         await db.usage_records.insert_one(usage_record)
         
-        # Create transaction and deduct wallet
-        tx = {
-            "id": str(uuid.uuid4()),
-            "company_id": company_id,
-            "wallet_id": wallet["id"],
-            "type": "DEBIT",
-            "amount": customer_cost,
-            "currency": wallet["currency"],
-            "payment_provider": "wallet",
-            "provider_transaction_id": call_id,
-            "status": "COMPLETED",
-            "description": f"Voice usage: {duration_minutes} min ({direction})",
-            "created_at": datetime.utcnow()
-        }
-        await db.transactions.insert_one(tx)
-        
-        new_balance = wallet["balance"] - customer_cost
-        await db.wallets.update_one(
-            {"id": wallet["id"]},
-            {"$set": {"balance": new_balance, "updated_at": datetime.utcnow()}}
-        )
+        # Only debit wallet if cost > 0
+        if customer_cost > 0:
+            tx = {
+                "id": str(uuid.uuid4()),
+                "company_id": company_id,
+                "wallet_id": wallet["id"],
+                "type": "DEBIT",
+                "amount": customer_cost,
+                "currency": wallet["currency"],
+                "payment_provider": "wallet",
+                "provider_transaction_id": call_id,
+                "status": "COMPLETED",
+                "description": f"Voice usage: {int(round(duration_seconds))}s ({direction})",
+                "created_at": datetime.utcnow()
+            }
+            await db.transactions.insert_one(tx)
+            
+            new_balance = round(wallet["balance"] - customer_cost, 2)
+            await db.wallets.update_one(
+                {"id": wallet["id"]},
+                {"$set": {"balance": new_balance, "updated_at": datetime.utcnow()}}
+            )
         
         return usage_record
 
     async def get_dashboard_data(self, db, company_id: str):
         wallet = await self.get_or_create_wallet(db, company_id)
         
-        # Active Plan
+        # Check company info and trial status
+        company = await db.companies.find_one({"company_id": company_id})
+        is_trial = not company or company.get("plan_type") == "trial"
+        plan_name = "Free Trial Starter" if is_trial else company.get("plan_type", "Pay-As-You-Go")
+        included_minutes = 10 if is_trial else 0
+        
+        # Active Plan subscription if any
         sub = await db.company_subscriptions.find_one({"company_id": company_id, "status": "active"})
-        plan_name = "Pay-As-You-Go"
-        included_minutes = 0
         if sub:
             plan = await db.subscription_plans.find_one({"id": sub["plan_id"]})
             if plan:
-                plan_name = plan["name"]
-                included_minutes = plan["included_minutes"]
+                plan_name = plan.get("name", plan_name)
+                included_minutes = plan.get("included_minutes", included_minutes)
                 
-        # Used minutes this month
         now = datetime.utcnow()
         start_of_month = datetime(now.year, now.month, 1)
         
         pipeline = [
-            {"$match": {"company_id": company_id, "created_at": {"$gte": start_of_month}}},
+            {"$match": {"company_id": company_id}},
             {"$group": {"_id": None, "total_seconds": {"$sum": "$duration_seconds"}, "total_cost": {"$sum": "$customer_cost"}}}
         ]
         
@@ -153,19 +163,40 @@ class BillingService:
         async for doc in cursor:
             agg.append(doc)
             
-        minutes_used = 0
-        total_spending = 0
-        if agg:
-            minutes_used = int((agg[0]["total_seconds"] + 59) // 60)
-            total_spending = agg[0]["total_cost"]
+        minutes_used = 0.0
+        total_spending = 0.0
+        if agg and agg[0].get("total_seconds"):
+            minutes_used = round(agg[0]["total_seconds"] / 60.0, 1)
+            total_spending = round(agg[0].get("total_cost", 0.0), 2)
+        else:
+            # Fallback to calls collection if usage_records was not created for legacy calls
+            calls_cursor = db.calls.find({"company_id": company_id})
+            calls_seconds = 0.0
+            async for c in calls_cursor:
+                calls_seconds += float(c.get("duration_seconds") or 0)
+            if calls_seconds > 0:
+                minutes_used = round(calls_seconds / 60.0, 1)
+                total_spending = round(calls_seconds * 0.20, 2)
+
+        total_calls = await db.calls.count_documents({"company_id": company_id})
+        completed_calls = await db.calls.count_documents({"company_id": company_id, "status": {"$in": ["Completed", "Analyzed"]}})
+        
+        minutes_remaining = max(0.0, round(included_minutes - minutes_used, 1)) if included_minutes > 0 else 0.0
             
         return {
-            "balance": wallet["balance"],
+            "balance": round(wallet.get("balance", 0.0), 2),
+            "currency": wallet.get("currency", "INR"),
             "plan_name": plan_name,
+            "is_trial": is_trial,
             "minutes_used": minutes_used,
             "minutes_included": included_minutes,
+            "minutes_remaining": minutes_remaining,
             "total_spending": total_spending,
-            "billing_period": f"{start_of_month.strftime('%B 1')} - {now.strftime('%B %d')}"
+            "total_calls": total_calls,
+            "completed_calls": completed_calls,
+            "rate_per_minute": 12.0,
+            "company_name": company.get("name") if company else "Company",
+            "billing_period": f"{start_of_month.strftime('%B 1')} - {now.strftime('%B %d, %Y')}"
         }
 
 billing_service = BillingService()

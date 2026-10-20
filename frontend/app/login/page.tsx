@@ -94,8 +94,12 @@ export default function LoginPage() {
 
         <p className="mt-6 text-center text-sm text-muted-foreground">
           New company?{' '}
-          <a href="/request-access" className="font-semibold text-primary hover:underline">
-            Request access
+          <a href="/register" className="font-semibold text-primary hover:underline">
+            Start Free Trial
+          </a>
+          <span className="mx-1 text-muted-foreground/60">•</span>
+          <a href="/request-access" className="text-xs text-muted-foreground hover:underline">
+            Request Demo
           </a>
         </p>
       </div>

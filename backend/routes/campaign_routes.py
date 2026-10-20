@@ -15,7 +15,11 @@ campaign_router = APIRouter()
 async def create_campaign(payload: dict = Body(...), current_user: dict = Depends(require_company_access)):
     enforce_no_foreign_company(current_user, payload)
     name = payload.get("name")
-    property_name = payload.get("property")
+    offering_name = payload.get("offering") or payload.get("property") or ""
+    industry = payload.get("industry")
+    if not industry:
+        comp = await db.companies.find_one({"company_id": current_user["company_id"]})
+        industry = comp.get("industry") if comp else "general_sales"
 
     if not name:
         raise HTTPException(status_code=400, detail="Campaign name is required")
@@ -26,7 +30,9 @@ async def create_campaign(payload: dict = Body(...), current_user: dict = Depend
     doc = {
         "campaign_id": campaign_id,
         "name": name,
-        "property": property_name or "",
+        "industry": industry,
+        "offering": offering_name,
+        "property": offering_name,
         "created_at": datetime.utcnow(),
         "leads_count": 0,
         "calls_made": 0,
@@ -42,10 +48,13 @@ async def create_campaign(payload: dict = Body(...), current_user: dict = Depend
     return doc
 
 @campaign_router.get("/campaigns")
-async def list_campaigns(current_user: dict = Depends(require_company_access)):
+async def list_campaigns(industry: str = None, current_user: dict = Depends(require_company_access)):
     db = mongodb.get_db()
     company_id = current_user["company_id"]
-    campaigns = await db.campaigns.find(tenant_filter(current_user)).sort("created_at", -1).to_list(length=100)
+    query = tenant_filter(current_user)
+    if industry and industry.lower() != "all":
+        query["industry"] = industry.lower()
+    campaigns = await db.campaigns.find(query).sort("created_at", -1).to_list(length=100)
 
     campaign_ids = [c.get("campaign_id") for c in campaigns if c.get("campaign_id")]
 
@@ -67,7 +76,7 @@ async def list_campaigns(current_user: dict = Depends(require_company_access)):
             {"$group": {
                 "_id": "$campaign_id",
                 "calls_made": {"$sum": 1},
-                "connected": {"$sum": {"$cond": [{"$in": ["$status", ["Completed", "completed"]]}, 1, 0]}},
+                "connected": {"$sum": {"$cond": [{"$in": ["$status", ["Completed", "completed", "Analyzed"]]}, 1, 0]}},
                 "interested": {"$sum": {"$cond": [{"$in": ["$analysis.lead_temperature", ["Warm", "Hot"]]}, 1, 0]}}
             }}
         ])

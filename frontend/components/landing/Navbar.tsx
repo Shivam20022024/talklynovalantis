@@ -21,8 +21,8 @@ export const Navbar = () => {
 
   const navLinks = [
     { name: 'Features', href: '#features' },
-    { name: 'How its works', href: '#how-it-works' },
-    { name: 'Pricing', href: '#pricing' },
+    { name: 'How it works', href: '#how-it-works' },
+    { name: 'Pricing', href: '/pricing' },
   ];
 
   const handleScrollTo = (e: React.MouseEvent<HTMLAnchorElement>, href: string) => {
@@ -103,8 +103,11 @@ export const Navbar = () => {
                 {resolvedTheme === 'dark' ? <Sun size={20} /> : <Moon size={20} />}
               </button>
             )}
-            <button onClick={() => window.location.href = "/login"} className="bg-gradient-to-r from-brand-primary to-brand-muted  text-white dark:text-bg-dark-card px-6 py-2.5 rounded-xl text-sm font-bold shadow-md shadow-theme-500/20 transition-all hover:opacity-90 hover:scale-105 active:scale-95">
+            <button onClick={() => window.location.href = "/login"} className="text-gray-600 dark:text-gray-300 hover:text-foreground text-sm font-semibold px-2 py-1.5 transition-colors">
               Login
+            </button>
+            <button onClick={() => window.location.href = "/register"} className="bg-gradient-to-r from-brand-primary to-brand-muted text-white dark:text-bg-dark-card px-5 py-2.5 rounded-xl text-sm font-bold shadow-md shadow-theme-500/20 transition-all hover:opacity-90 hover:scale-105 active:scale-95">
+              Free Trial
             </button>
           </div>
 

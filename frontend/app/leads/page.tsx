@@ -1,20 +1,27 @@
 'use client'
 
 import { useEffect, useRef, useState, Suspense } from 'react'
-import { Download, MoreHorizontal, Phone, Search, Upload, Loader2, Plus, X, User, MapPin, Home, Sparkles, MessageSquare, Clock, ArrowRight, Trash2 } from 'lucide-react'
+import { Download, MoreHorizontal, Phone, Search, Upload, Loader2, Plus, X, User, MapPin, Home, Briefcase, Sparkles, MessageSquare, Clock, ArrowRight, Trash2 } from 'lucide-react'
 import AppLayout from '@/components/layout/AppLayout'
 import { fetchApi, getAuthToken, API_BASE_URL } from '@/lib/api'
 import { useSearchParams, useRouter } from 'next/navigation'
+import { useAuth } from '@/components/providers/AuthProvider'
+import { INDUSTRY_CONFIGS, IndustryKey } from '@/lib/industry'
 
 function LeadsContent() {
+  const { user } = useAuth()
+  const activeIndustry = (user?.industry as IndustryKey) || 'bfsi'
+
   const [leads, setLeads] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [query, setQuery] = useState('')
   const [range, setRange] = useState('All Time')
+  const [industryFilter, setIndustryFilter] = useState<string>('all')
   const [uploading, setUploading] = useState(false)
   const [showModal, setShowModal] = useState(false)
   const [showQuickCallModal, setShowQuickCallModal] = useState(false)
   const [quickCallNumber, setQuickCallNumber] = useState('')
+  const [quickCallName, setQuickCallName] = useState('')
   const [calling, setCalling] = useState(false)
   const [selectedLead, setSelectedLead] = useState<any>(null)
   const [selectedCall, setSelectedCall] = useState<any>(null)
@@ -78,6 +85,11 @@ function LeadsContent() {
   const visibleLeads = leads
     .filter((l) => l.name?.toLowerCase().includes(query.toLowerCase()) || String(l.phone || '').includes(query))
     .filter((l) => filterStatus ? (l.status || '').toLowerCase() === filterStatus.toLowerCase() : true)
+    .filter((l) => {
+      if (industryFilter === 'all') return true
+      if (industryFilter === 'active') return l.industry === activeIndustry
+      return l.industry === industryFilter
+    })
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -99,19 +111,26 @@ function LeadsContent() {
 
   const handleQuickCall = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (!quickCallName.trim()) {
+      alert('Please enter the customer name')
+      return
+    }
     setCalling(true)
     try {
       await fetchApi('/api/v1/calls/trigger', {
         method: 'POST',
         body: JSON.stringify({
           phone_number: quickCallNumber,
+          customer_name: quickCallName.trim(),
           lead_id: 'quick-call-' + Date.now(),
           campaign_language: 'English'
         })
       })
-      alert('Call dispatched successfully!')
+      alert(`Call dispatched successfully to ${quickCallName.trim()}!`)
       setShowQuickCallModal(false)
       setQuickCallNumber('')
+      setQuickCallName('')
+      loadLeads()
     } catch (e: any) {
       alert(`Failed to dispatch call: ${e.message}`)
     } finally {
@@ -170,11 +189,12 @@ function LeadsContent() {
 
   const handleCall = async (lead: any) => {
     try {
-      alert(`Initiating call to ${lead.phone}...`)
+      alert(`Initiating call to ${lead.name || 'Lead'} (${lead.phone})...`)
       await fetchApi('/api/v1/calls/trigger', {
         method: 'POST',
         body: JSON.stringify({
           phone_number: lead.phone,
+          customer_name: lead.name,
           lead_id: lead.lead_id || 'manual-lead',
           campaign_language: 'English'
         })
@@ -187,8 +207,8 @@ function LeadsContent() {
 
   const handleDownload = () => {
     if (leads.length === 0) return alert("No data to download")
-    const csv = ["Name,Phone,Property,Location,Status,AI Score"]
-    leads.forEach(l => csv.push(`${l.name},${l.phone},${l.property || ''},${l.location || ''},${l.status},${l.aiScore}`))
+    const csv = ["Name,Phone,Offering,Location,Status,AI Score"]
+    leads.forEach(l => csv.push(`${l.name},${l.phone},${l.offering || l.property || ''},${l.location || ''},${l.status},${l.aiScore}`))
     const blob = new Blob([csv.join('\n')], { type: 'text/csv' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -248,6 +268,18 @@ function LeadsContent() {
               <option value="Converted">Converted</option>
               <option value="Not Interested">Not Interested</option>
             </select>
+            <select
+              value={industryFilter}
+              onChange={(e) => setIndustryFilter(e.target.value)}
+              className="rounded-lg border border-border bg-card px-3 py-2 text-sm font-bold text-foreground outline-none focus:ring-2 focus:ring-ring"
+            >
+              <option value="all">All Sectors ({leads.length})</option>
+              <option value="active">{INDUSTRY_CONFIGS[activeIndustry]?.shortLabel || 'Active Sector'} ({leads.filter(l => l.industry === activeIndustry).length})</option>
+              <option value="real_estate">Real Estate ({leads.filter(l => l.industry === 'real_estate').length})</option>
+              <option value="bfsi">BFSI & Lending ({leads.filter(l => l.industry === 'bfsi').length})</option>
+              <option value="healthcare">Healthcare ({leads.filter(l => l.industry === 'healthcare').length})</option>
+              <option value="edtech">EdTech ({leads.filter(l => l.industry === 'edtech').length})</option>
+            </select>
             {campaignId && (
               <button 
                 onClick={() => {
@@ -296,7 +328,7 @@ function LeadsContent() {
                 </th>
                 <th className="pb-3 font-semibold">Lead</th>
                 <th className="pb-3 font-semibold">Phone</th>
-                <th className="pb-3 font-semibold">Property</th>
+                <th className="pb-3 font-semibold">Offering / Details</th>
                 <th className="pb-3 font-semibold">Location</th>
                 <th className="pb-3 font-semibold">Status</th>
                 <th className="pb-3 font-semibold">AI Score</th>
@@ -324,7 +356,16 @@ function LeadsContent() {
                     </td>
                     <td className="py-4 font-semibold text-sm">{lead.name}</td>
                     <td className="py-4 text-xs font-medium text-muted-foreground">{lead.phone}</td>
-                    <td className="py-4 text-xs">{lead.property || '-'}</td>
+                    <td className="py-4 text-xs">
+                      <div className="flex flex-col">
+                        <span className="font-semibold text-foreground">{lead.offering || lead.property || '-'}</span>
+                        {lead.industry && (
+                          <span className="text-[10px] text-muted-foreground uppercase font-bold tracking-wider">
+                            {INDUSTRY_CONFIGS[lead.industry as IndustryKey]?.shortLabel || lead.industry}
+                          </span>
+                        )}
+                      </div>
+                    </td>
                     <td className="py-4 text-xs">{lead.location || '-'}</td>
                     <td className="py-4">
                       <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[10px] font-semibold bg-emerald-50 text-emerald-700`}>
@@ -369,8 +410,8 @@ function LeadsContent() {
                 <input required value={newLead.phone} onChange={(e) => setNewLead({...newLead, phone: e.target.value})} className="mt-1 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary" placeholder="e.g. +1 555-0123" />
               </div>
               <div>
-                <label className="text-xs font-semibold text-muted-foreground">Property (Optional)</label>
-                <input value={newLead.property} onChange={(e) => setNewLead({...newLead, property: e.target.value})} className="mt-1 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary" placeholder="e.g. Luxury Villa" />
+                <label className="text-xs font-semibold text-muted-foreground">Offering / Product / Service (Optional)</label>
+                <input value={newLead.property} onChange={(e) => setNewLead({...newLead, property: e.target.value})} className="mt-1 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary" placeholder="e.g. Full-Stack Web Dev / Villa / Dental Checkup" />
               </div>
               <button disabled={creating} className="w-full mt-4 flex items-center justify-center gap-2 rounded-lg bg-primary py-2.5 text-sm font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-50">
                 {creating ? <Loader2 size={16} className="animate-spin" /> : 'Add Lead'}
@@ -384,13 +425,32 @@ function LeadsContent() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm p-4">
           <div className="w-full max-w-md rounded-xl border border-border bg-card p-6 shadow-lg">
             <div className="flex justify-between items-center mb-5">
-              <h2 className="text-lg font-bold">Quick Call</h2>
+              <div>
+                <h2 className="text-lg font-bold">Quick Call</h2>
+                <p className="text-xs text-muted-foreground mt-0.5">TalklyAI will greet this customer by name during the call.</p>
+              </div>
               <button onClick={() => setShowQuickCallModal(false)} className="text-muted-foreground hover:text-foreground"><X size={18} /></button>
             </div>
             <form onSubmit={handleQuickCall} className="space-y-4">
               <div>
+                <label className="text-xs font-semibold text-muted-foreground">Customer Name</label>
+                <input 
+                  required 
+                  value={quickCallName} 
+                  onChange={(e) => setQuickCallName(e.target.value)} 
+                  className="mt-1 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary" 
+                  placeholder="e.g. Rahul Sharma" 
+                />
+              </div>
+              <div>
                 <label className="text-xs font-semibold text-muted-foreground">Phone Number</label>
-                <input required value={quickCallNumber} onChange={(e) => setQuickCallNumber(e.target.value)} className="mt-1 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary" placeholder="e.g. +1 555-0123" />
+                <input 
+                  required 
+                  value={quickCallNumber} 
+                  onChange={(e) => setQuickCallNumber(e.target.value)} 
+                  className="mt-1 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary" 
+                  placeholder="e.g. +91 9876543210" 
+                />
               </div>
               <button disabled={calling} className="w-full mt-4 flex items-center justify-center gap-2 rounded-lg bg-primary py-2.5 text-sm font-semibold text-primary-foreground hover:opacity-90 disabled:opacity-50">
                 {calling ? <Loader2 size={16} className="animate-spin" /> : 'Call Now'}
@@ -432,9 +492,9 @@ function LeadsContent() {
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div className="rounded-xl border border-border/50 bg-card p-4 shadow-sm transition-all hover:shadow-md">
                   <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
-                    <Home size={14} className="text-primary" /> Property
+                    <Briefcase size={14} className="text-primary" /> Offering
                   </div>
-                  <div className="text-sm font-medium line-clamp-2">{selectedLead.property || '-'}</div>
+                  <div className="text-sm font-medium line-clamp-2">{selectedLead.offering || selectedLead.property || '-'}</div>
                 </div>
                 
                 <div className="rounded-xl border border-border/50 bg-card p-4 shadow-sm transition-all hover:shadow-md">
@@ -467,6 +527,23 @@ function LeadsContent() {
                   </span>
                 </div>
               </div>
+
+              {/* Custom CSV Fields */}
+              {selectedLead.custom_fields && Object.keys(selectedLead.custom_fields).length > 0 && (
+                <div className="rounded-xl border border-border/50 bg-card p-4 shadow-sm">
+                  <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-3 flex items-center gap-1.5">
+                    <Sparkles size={13} className="text-primary" /> Custom Lead Data (CSV)
+                  </div>
+                  <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                    {Object.entries(selectedLead.custom_fields).map(([k, v]) => (
+                      <div key={k} className="rounded-lg bg-muted/40 p-2.5 border border-border/40">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground block">{k.replace(/_/g, ' ')}</span>
+                        <span className="text-xs font-medium text-foreground truncate block mt-0.5">{String(v || '-')}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Dynamic Extracted Fields from AI Analysis */}
               {selectedCall?.analysis && Object.keys(selectedCall.analysis).filter(k => !['summary', 'action_items', 'lead_score', 'lead_temperature', 'conversion_probability', 'customer_name', 'customer_id', 'sentiment', 'status'].includes(k)).length > 0 && (

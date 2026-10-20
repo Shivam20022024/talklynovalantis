@@ -1,3 +1,4 @@
+
 # server.py
 import os
 import sys
@@ -39,10 +40,13 @@ import openpyxl
 from fastapi.concurrency import run_in_threadpool
 from process_audio import process_uploaded_audio, get_weekly_excel_file, analyze_transcript_text
 import mongodb
+from industry_templates import INDUSTRY_TEMPLATES
+from services.crm_service import crm_service
 from services.language_service import LanguageService
 from services.intelligence_service import IntelligenceService
 language_service = LanguageService()
 intelligence_service = IntelligenceService()
+from services.whatsapp_service import whatsapp_service
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 
@@ -66,7 +70,14 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8000",
+        "http://localhost:8002",
+        "http://127.0.0.1:8002"
+    ],
+    allow_origin_regex=r"https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -80,6 +91,7 @@ from routes.billing_routes import billing_router
 from routes.admin_routes import admin_router
 from routes.agent_routes import agent_router
 from routes.access_requests import access_requests_router
+from routes.telephony_routes import telephony_router
 from inbound.routes import inbound_router
 
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["Auth"])
@@ -90,9 +102,12 @@ app.include_router(admin_router, prefix="/api/v1/super-admin", tags=["Super Admi
 app.include_router(campaign_router, prefix="/api/v1", tags=["Campaigns"])
 app.include_router(lead_router, prefix="/api/v1", tags=["Leads"])
 app.include_router(agent_router, prefix="/api/v1", tags=["Agent"])
+app.include_router(telephony_router, prefix="/api/v1/telephony", tags=["Telephony"])
 app.include_router(inbound_router, prefix="/api/v1/inbound")
 app.include_router(access_requests_router, prefix="/api/v1/access-requests")
 app.include_router(access_requests_router, prefix="/api/v1/admin/access-requests")
+from routes.whatsapp_routes import whatsapp_router
+app.include_router(whatsapp_router)
 
 from services.billing_service import billing_service
 @app.get("/")
@@ -101,9 +116,9 @@ async def health_check():
     return {"status": "ok", "service": "TalklyAI Backend"}
 
 @app.get("/api/v1/analytics/dashboard")
-async def get_analytics_dashboard(range: str = "30 Days", campaign_id: str = None, current_user: dict = Depends(require_company_access)):
+async def get_analytics_dashboard(range: str = "30 Days", campaign_id: str = None, industry: str = None, current_user: dict = Depends(require_company_access)):
     db = mongodb.get_db()
-    metrics = await intelligence_service.get_dashboard_metrics(db, current_user["company_id"], range, campaign_id)
+    metrics = await intelligence_service.get_dashboard_metrics(db, current_user["company_id"], range, campaign_id, industry)
     return {"status": "success", "data": metrics}
 
 @app.get("/api/v1/analytics/overall")
@@ -197,7 +212,7 @@ async def publish_prompt(payload: dict | None = Body(None), current_user: dict =
         raise HTTPException(status_code=400, detail="Nothing to publish - save a draft first")
 
     company = await db.companies.find_one({"company_id": company_id})
-    agent_id = (company or {}).get("bolna_agent_id")
+    agent_id = (company or {}).get("bolna_agent_id") or os.environ.get("BOLNA_AGENT_ID")
     if not agent_id:
         raise HTTPException(
             status_code=400,
@@ -299,9 +314,13 @@ async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Dep
     
     db = mongodb.get_db()
     
-    # Fetch real customer name if lead exists (scoped to this company)
-    customer_name = "Phone Lead"
-    if lead_id and not lead_id.startswith("test-agent-call-"):
+    # Fetch real customer name if provided or if lead exists (scoped to this company)
+    customer_name = ""
+    if payload.get("customer_name") and str(payload.get("customer_name")).strip():
+        customer_name = str(payload.get("customer_name")).strip()
+    elif payload.get("name") and str(payload.get("name")).strip():
+        customer_name = str(payload.get("name")).strip()
+    elif lead_id and not lead_id.startswith("test-agent-call-"):
         lead = await db.leads.find_one(tenant_filter(current_user, {"lead_id": payload.get("lead_id")}))
         if not lead:
             try:
@@ -311,6 +330,14 @@ async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Dep
                 pass
         if lead and lead.get("name"):
             customer_name = lead.get("name").strip()
+
+    if not customer_name:
+        existing_lead = await db.leads.find_one(tenant_filter(current_user, {"phone": phone_number}))
+        if existing_lead and existing_lead.get("name"):
+            customer_name = existing_lead.get("name").strip()
+
+    if not customer_name:
+        customer_name = "Valued Customer"
 
     # 2. Resolve this company's dedicated Bolna agent (never a shared global agent in strict mode)
     try:
@@ -324,6 +351,36 @@ async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Dep
     
     # Always fetch latest BASE_URL to ensure it reflects current ngrok/tunnel
     current_base_url = os.environ.get("BASE_URL", "http://localhost:8000").strip()
+
+    call_industry = payload.get("industry")
+    if not call_industry and 'lead' in locals() and lead:
+        call_industry = lead.get("industry")
+        if not call_industry and lead.get("campaign_id"):
+            camp = await db.campaigns.find_one({"campaign_id": lead.get("campaign_id"), "company_id": current_user["company_id"]})
+            if camp:
+                call_industry = camp.get("industry")
+    if not call_industry:
+        company_doc = await db.companies.find_one({"company_id": current_user["company_id"]})
+        if company_doc:
+            call_industry = company_doc.get("industry", "general_sales")
+
+    # If this is a quick call, insert or update the lead in CRM so it shows on the Leads page
+    if lead_id.startswith("quick-call-"):
+        await db.leads.insert_one({
+            "lead_id": lead_id,
+            "name": customer_name,
+            "phone": phone_number,
+            "offering": payload.get("offering", ""),
+            "property": payload.get("offering", ""),
+            "location": payload.get("location", ""),
+            "industry": call_industry,
+            "custom_fields": {},
+            "status": "Calling",
+            "aiScore": 0,
+            "lastContact": datetime.utcnow().isoformat(),
+            "created_at": datetime.utcnow(),
+            "company_id": current_user["company_id"]
+        })
     
     await db.calls.insert_one({
         "call_id": lead_id,
@@ -341,7 +398,8 @@ async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Dep
         "voice_gender": voice_gender,
         "regional_accent": regional_accent,
         "company_id": current_user["company_id"],
-        "campaign_id": lead.get("campaign_id") if 'lead' in locals() and lead else None
+        "campaign_id": lead.get("campaign_id") if 'lead' in locals() and lead else None,
+        "industry": call_industry
     })
 
     url = "https://api.bolna.ai/call"
@@ -375,7 +433,56 @@ async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Dep
     prompt_text = base_prompt.replace("{{customer_name}}", customer_name)
     company = await db.companies.find_one({"company_id": current_user["company_id"]})
     company_name_val = company.get("name") if company else "Company"
+    
+    # Resolve Caller ID (Dedicated Custom Line or Talkly Shared Line)
+    company_telephony = company.get("telephony") if company else {}
+    if company_telephony and company_telephony.get("mode") == "custom" and company_telephony.get("phone_number"):
+        caller_id = company_telephony["phone_number"]
+        telephony_provider = company_telephony.get("provider", "custom")
+        # Note: Bolna agent e8ea6527 uses Plivo as its carrier. Only send from_phone_number if provider is Plivo
+        if telephony_provider.lower() == "plivo":
+            bolna_payload["from_phone_number"] = caller_id
+    else:
+        shared_env = os.environ.get("TALKLY_SHARED_NUMBER", "").strip()
+        if shared_env and shared_env != "+918031830100":
+            bolna_payload["from_phone_number"] = shared_env
+            caller_id = shared_env
+        else:
+            caller_id = "Talkly Shared Carrier"
+        telephony_provider = "talkly_shared"
+
+    bolna_payload["user_data"]["caller_id"] = caller_id
+    bolna_payload["user_data"]["telephony_provider"] = telephony_provider
     prompt_text = prompt_text.replace("{{company_name}}", company_name_val)
+
+    # Dynamic variables from lead record
+    lead_obj = await db.leads.find_one({"lead_id": lead_id})
+    lead_dict = lead_obj or {}
+    offering_val = str(lead_dict.get("offering") or lead_dict.get("property") or "").strip()
+    if not offering_val and lead_dict.get("campaign_id"):
+        camp = await db.campaigns.find_one({"campaign_id": lead_dict["campaign_id"]})
+        if camp:
+            offering_val = str(camp.get("offering") or camp.get("property") or "").strip()
+    if not offering_val:
+        offering_val = str(payload.get("offering") or "").strip()
+    if not offering_val:
+        industry_fallbacks = {
+            "real_estate": "property",
+            "healthcare": "consultation",
+            "edtech": "program",
+            "bfsi": "loan",
+            "general_sales": "solution"
+        }
+        offering_val = industry_fallbacks.get(call_industry, "service")
+
+    location_val = str(lead_dict.get("location") or payload.get("location") or "")
+    prompt_text = prompt_text.replace("{{offering}}", offering_val)
+    prompt_text = prompt_text.replace("{{property_name}}", offering_val)
+    prompt_text = prompt_text.replace("{{property_location}}", location_val)
+    prompt_text = prompt_text.replace("{{location}}", location_val)
+    for ck, cv in lead_dict.get("custom_fields", {}).items():
+        if cv is not None:
+            prompt_text = prompt_text.replace(f"{{{{{ck}}}}}", str(cv))
     
     bolna_payload["user_data"]["company_name"] = company_name_val
     # Add language instructions if not English
@@ -383,11 +490,23 @@ async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Dep
         prompt_text += f"\n\nIMPORTANT: You MUST speak entirely in the {campaign_language} language. Please reply naturally in {campaign_language}."
 
     bolna_payload["user_data"]["system_prompt"] = prompt_text
+    bolna_payload["agent_prompts"] = {
+        "task_1": {
+            "system_prompt": prompt_text
+        }
+    }
 
     welcome_message = _wm
     if welcome_message:
         welcome_text = welcome_message.replace("{{customer_name}}", customer_name)
         welcome_text = welcome_text.replace("{{company_name}}", company_name_val)
+        welcome_text = welcome_text.replace("{{offering}}", offering_val)
+        welcome_text = welcome_text.replace("{{property_name}}", offering_val)
+        welcome_text = welcome_text.replace("{{property_location}}", location_val)
+        welcome_text = welcome_text.replace("{{location}}", location_val)
+        for ck, cv in lead_dict.get("custom_fields", {}).items():
+            if cv is not None:
+                welcome_text = welcome_text.replace(f"{{{{{ck}}}}}", str(cv))
         bolna_payload["agent_config"] = {
             "agent_welcome_message": welcome_text
         }
@@ -454,6 +573,15 @@ async def process_bulk_calls(contacts: list, campaign_language: str = "English",
         lead_id = contact.get("lead_id") or f"bulk_{int(time.time() * 1000)}_{idx}"
         
         campaign_id_val = contact.get("campaign_id")
+        contact_industry = contact.get("industry")
+        if not contact_industry and campaign_id_val:
+            camp = await db.campaigns.find_one({"campaign_id": campaign_id_val})
+            if camp:
+                contact_industry = camp.get("industry")
+        if not contact_industry and company_id:
+            comp = await db.companies.find_one({"company_id": company_id})
+            if comp:
+                contact_industry = comp.get("industry")
         
         await db.calls.insert_one({
             "call_id": lead_id,
@@ -471,7 +599,8 @@ async def process_bulk_calls(contacts: list, campaign_language: str = "English",
             "voice_gender": voice_gender,
             "regional_accent": regional_accent,
             "company_id": company_id,
-            "campaign_id": campaign_id_val
+            "campaign_id": campaign_id_val,
+            "industry": contact_industry
         })
         
         bolna_payload = {
@@ -498,7 +627,36 @@ async def process_bulk_calls(contacts: list, campaign_language: str = "English",
         prompt_text = base_prompt.replace("{{customer_name}}", customer_name)
         company = await db.companies.find_one({"company_id": company_id})
         company_name_val = company.get("name") if company else "Company"
+
+        company_telephony = company.get("telephony") if company else {}
+        if company_telephony and company_telephony.get("mode") == "custom" and company_telephony.get("phone_number"):
+            caller_id = company_telephony["phone_number"]
+            telephony_provider = company_telephony.get("provider", "custom")
+            if telephony_provider.lower() == "plivo":
+                bolna_payload["from_phone_number"] = caller_id
+        else:
+            shared_env = os.environ.get("TALKLY_SHARED_NUMBER", "").strip()
+            if shared_env and shared_env != "+918031830100":
+                bolna_payload["from_phone_number"] = shared_env
+                caller_id = shared_env
+            else:
+                caller_id = "Talkly Shared Carrier"
+            telephony_provider = "talkly_shared"
+
+        bolna_payload["user_data"]["caller_id"] = caller_id
+        bolna_payload["user_data"]["telephony_provider"] = telephony_provider
         prompt_text = prompt_text.replace("{{company_name}}", company_name_val)
+
+        # Dynamic variable replacement from contact/lead
+        offering_val = str(contact.get("offering") or contact.get("property") or "")
+        location_val = str(contact.get("location") or "")
+        prompt_text = prompt_text.replace("{{offering}}", offering_val)
+        prompt_text = prompt_text.replace("{{property_name}}", offering_val)
+        prompt_text = prompt_text.replace("{{property_location}}", location_val)
+        prompt_text = prompt_text.replace("{{location}}", location_val)
+        for ck, cv in contact.get("custom_fields", {}).items():
+            if cv is not None:
+                prompt_text = prompt_text.replace(f"{{{{{ck}}}}}", str(cv))
         
         bolna_payload["user_data"]["company_name"] = company_name_val
         
@@ -507,11 +665,23 @@ async def process_bulk_calls(contacts: list, campaign_language: str = "English",
             prompt_text += f"\n\nIMPORTANT: You MUST speak entirely in the {campaign_language} language. Please reply naturally in {campaign_language}."
 
         bolna_payload["user_data"]["system_prompt"] = prompt_text
+        bolna_payload["agent_prompts"] = {
+            "task_1": {
+                "system_prompt": prompt_text
+            }
+        }
         
         welcome_message = _wm
         if welcome_message:
             welcome_text = welcome_message.replace("{{customer_name}}", customer_name)
             welcome_text = welcome_text.replace("{{company_name}}", company_name_val)
+            welcome_text = welcome_text.replace("{{offering}}", offering_val)
+            welcome_text = welcome_text.replace("{{property_name}}", offering_val)
+            welcome_text = welcome_text.replace("{{property_location}}", location_val)
+            welcome_text = welcome_text.replace("{{location}}", location_val)
+            for ck, cv in contact.get("custom_fields", {}).items():
+                if cv is not None:
+                    welcome_text = welcome_text.replace(f"{{{{{ck}}}}}", str(cv))
             bolna_payload["agent_config"] = {
                 "agent_welcome_message": welcome_text
             }
@@ -733,11 +903,41 @@ async def send_email(payload: dict = Body(...), current_user: dict = Depends(req
 async def sync_lead_status_from_call(db, lead_id: str, analysis_result: dict):
     if not analysis_result:
         return
-    lead_temperature = analysis_result.get("lead_temperature")
-    if lead_temperature in ["Hot", "Warm"]:
-        lead_status = "Interested" if lead_temperature == "Warm" else "Qualified"
-    elif analysis_result.get("conversion_probability", 0) > 80:
+        
+    intents = analysis_result.get("intents") or []
+    summary = (analysis_result.get("summary") or "").lower()
+    conv_prob = analysis_result.get("conversion_probability") or 0
+    reqs = analysis_result.get("requirements") or analysis_result.get("property_requirements") or {}
+    timeline = reqs.get("timeline") if isinstance(reqs, dict) else None
+    lead_temp = analysis_result.get("lead_temperature")
+
+    # Detect if appointment / demo session / visit / sanction callback was scheduled across all 5 use cases
+    conversion_intent_keywords = [
+        "Appointment Booking", "Demo Booking", "Site Visit", "Demo Scheduled", "Enrollment", "Converted",
+        "Doctor Consultation", "Consultation Confirmed", "Doctor Appointment", "Clinic Visit", "Slot Confirmed",
+        "Loan Application", "Documentation Callback", "Sanction Request", "Pre-Approval", "Sanction Ready",
+        "Executive Walkthrough", "Product Demo", "Meeting Scheduled", "Screen-share Demo"
+    ]
+    summary_conversion_keywords = [
+        "confirmed participation", "confirmed seat", "confirmed demo", "seat confirmed", "booked",
+        "appointment confirmed", "scheduled", "demo session", "masterclass", "site visit", "visit confirmed",
+        "visit scheduled", "consultation confirmed", "sanction quote", "documentation callback",
+        "document verification", "walkthrough", "screen-share", "demo booked"
+    ]
+
+    is_converted = (
+        any(i in conversion_intent_keywords for i in intents)
+        or bool(timeline and any(w in str(timeline).lower() for w in ["sat", "sun", "mon", "tue", "wed", "thu", "fri", "am", "pm", "today", "tomorrow", "weekend", "week", "morning", "afternoon", "evening"]))
+        or any(k in summary for k in summary_conversion_keywords)
+        or conv_prob >= 70
+    )
+
+    if is_converted:
         lead_status = "Converted"
+    elif lead_temp == "Hot" or conv_prob >= 50 or analysis_result.get("lead_score", 0) >= 75:
+        lead_status = "Qualified"
+    elif lead_temp in ["Warm", "Hot"] or analysis_result.get("lead_score", 0) >= 40:
+        lead_status = "Interested"
     else:
         lead_status = "Contacted"
         
@@ -747,13 +947,17 @@ async def sync_lead_status_from_call(db, lead_id: str, analysis_result: dict):
         "lastContact": datetime.utcnow().isoformat()
     }
     
-    # Extract property and location if available
-    reqs = analysis_result.get("property_requirements", {})
+    # Extract requirements (general offering or property) and location if available
+    reqs = analysis_result.get("requirements") or analysis_result.get("property_requirements", {})
     if isinstance(reqs, dict):
-        if reqs.get("propertyType") or reqs.get("property_type"):
-            update_data["property"] = reqs.get("propertyType") or reqs.get("property_type")
+        offering_val = reqs.get("offering") or reqs.get("propertyType") or reqs.get("property_type")
+        if offering_val:
+            update_data["property"] = offering_val
+            update_data["offering"] = offering_val
         if reqs.get("location"):
             update_data["location"] = reqs.get("location")
+        if reqs.get("budget"):
+            update_data["budget"] = reqs.get("budget")
 
     await db.leads.update_one(
         {"lead_id": lead_id},
@@ -817,6 +1021,10 @@ async def poll_bolna_execution(execution_id: str, lead_id: str, api_key: str):
                             "analysis": analysis_result
                         })
                         await sync_lead_status_from_call(db, lead_id, analysis_result)
+                        # Auto-dispatch to external CRM / Webhook if configured
+                        asyncio.create_task(crm_service.sync_call_to_crm(db, lead_id))
+                        # Auto-dispatch WhatsApp reminder / confirmation
+                        asyncio.create_task(whatsapp_service.process_post_call_whatsapp(db, lead_id))
                     else:
                         update_data["status"] = "Completed"
                     
@@ -941,6 +1149,10 @@ async def bolna_webhook(data: dict = Body(...)):
                         "analysis": analysis_result
                     })
                     await sync_lead_status_from_call(db, lead_id, analysis_result)
+                    # Auto-dispatch to external CRM / Webhook if configured
+                    asyncio.create_task(crm_service.sync_call_to_crm(db, lead_id))
+                    # Auto-dispatch WhatsApp reminder / confirmation
+                    asyncio.create_task(whatsapp_service.process_post_call_whatsapp(db, lead_id))
                 else:
                     update_data["status"] = "Completed"
             except Exception as e:
@@ -1080,6 +1292,22 @@ async def send_followup_email(call_id: str, current_user: dict = Depends(require
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/industry-templates")
+async def get_industry_templates():
+    """Returns pre-built prompt templates for multiple industries."""
+    return {"status": "success", "templates": INDUSTRY_TEMPLATES}
+
+@app.post("/api/v1/settings/test-webhook")
+async def test_webhook_endpoint(payload: dict = Body(...), current_user: dict = Depends(require_company_access)):
+    webhook_url = payload.get("webhook_url")
+    if not webhook_url:
+        raise HTTPException(status_code=400, detail="webhook_url is required")
+    try:
+        res = await crm_service.send_test_webhook(webhook_url)
+        return {"status": "success", "result": res}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Webhook test failed: {str(e)}")
 
 
 if __name__ == "__main__":

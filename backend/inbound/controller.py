@@ -28,8 +28,15 @@ async def handle_incoming_call(form_data: dict) -> str:
     
     if to_number_normalized:
         phone_doc = await db.phone_numbers.find_one({"phone_number": to_number_normalized})
-        if phone_doc and phone_doc.get("bolna_sip_uri"):
-            agent_sip_uri = phone_doc["bolna_sip_uri"]
+        if phone_doc:
+            if phone_doc.get("inbound_mode") == "forward_human" and phone_doc.get("fallback_number"):
+                fallback = phone_doc["fallback_number"]
+                return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Dial>{fallback}</Dial>
+</Response>"""
+            if phone_doc.get("bolna_sip_uri"):
+                agent_sip_uri = phone_doc["bolna_sip_uri"]
             
     # Generate TwiML forwarding to the officially configured Bolna Agent
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>

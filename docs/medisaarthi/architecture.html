@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MediSaarthi Architecture</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  /* layout: three stacked bands — telephony/live call, backend services, data + integrations;
+     a left-margin loop feeds knowledge grounding back up into the voice agent */
+  :root{
+    --bg:#EEF1F3; --surface:#FFFFFF; --surface-2:#E2E7EA;
+    --border:#B9C2C8; --border-strong:#2B3338;
+    --fg:#141A20; --muted:#5B6670;
+    --accent:#C8472F; --accent-2:#1F6F68;
+    --cat-tel:#2a78d6; --cat-tel-bg:#E1ECFB;
+    --cat-safety:#6250d6; --cat-safety-bg:#EBE7FC;
+    --cat-backend:#1baf7a; --cat-backend-bg:#DFF6ED;
+    --cat-frontend:#e87ba4; --cat-frontend-bg:#FBEAF1;
+    --cat-data:#eb6834; --cat-data-bg:#FCE8DD;
+    --cat-external:#eda100; --cat-external-bg:#FCEFD6;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#0D1214; --surface:#151C1F; --surface-2:#1E282B;
+      --border:#36454C; --border-strong:#C7D1D4;
+      --fg:#E7ECEE; --muted:#93A2A8;
+      --accent:#E2735A; --accent-2:#59B5A9;
+      --cat-tel:#3987e5; --cat-tel-bg:#17222D;
+      --cat-safety:#9085e9; --cat-safety-bg:#231F33;
+      --cat-backend:#199e70; --cat-backend-bg:#16271F;
+      --cat-frontend:#d55181; --cat-frontend-bg:#301D26;
+      --cat-data:#d95926; --cat-data-bg:#2E2019;
+      --cat-external:#c98500; --cat-external-bg:#2C2414;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0D1214; --surface:#151C1F; --surface-2:#1E282B;
+    --border:#36454C; --border-strong:#C7D1D4;
+    --fg:#E7ECEE; --muted:#93A2A8;
+    --accent:#E2735A; --accent-2:#59B5A9;
+    --cat-tel:#3987e5; --cat-tel-bg:#17222D;
+    --cat-safety:#9085e9; --cat-safety-bg:#231F33;
+    --cat-backend:#199e70; --cat-backend-bg:#16271F;
+    --cat-frontend:#d55181; --cat-frontend-bg:#301D26;
+    --cat-data:#d95926; --cat-data-bg:#2E2019;
+    --cat-external:#c98500; --cat-external-bg:#2C2414;
+    color-scheme: dark;
+  }
+  body{
+    background:var(--bg); color:var(--fg);
+    font-family:'IBM Plex Sans',system-ui,sans-serif;
+    margin:0; padding-bottom:40px;
+  }
+  .wrap{
+    max-width:1320px; margin:0 auto;
+    padding-left:max(16px, env(safe-area-inset-left,0px));
+    padding-right:max(16px, env(safe-area-inset-right,0px));
+  }
+  header.page{ padding-block:48px 24px; }
+  .eyebrow{
+    font-family:'IBM Plex Mono',monospace; font-size:12px; letter-spacing:.08em;
+    text-transform:uppercase; color:var(--accent-2); margin:0 0 10px;
+  }
+  h1{
+    font-size:clamp(26px,4vw,38px); line-height:1.15; margin:0 0 12px;
+    text-wrap:balance; font-weight:700;
+  }
+  .sub{
+    font-size:16px; line-height:1.55; color:var(--muted); max-width:62ch; margin:0;
+  }
+  .legend{
+    display:flex; flex-wrap:wrap; gap:18px 28px;
+    margin:28px 0 8px; padding:16px 18px;
+    background:var(--surface); border:1px solid var(--border); border-radius:10px;
+  }
+  .legend-item{ display:flex; align-items:center; gap:9px; font-size:13px; color:var(--muted); }
+  .swatch-box{ width:22px; height:16px; border-radius:3px; flex:none; }
+  .cat-legend .swatch-box{ border:1.5px solid; }
+  .sw-reused{ background:var(--surface-2); border:1.5px solid var(--border-strong); }
+  .sw-new{ background:transparent; border:1.5px dashed var(--border-strong); }
+  .swatch-line{ width:22px; height:0; border-top:2.5px solid; flex:none; }
+  .sw-live{ border-color:var(--accent); }
+  .sw-async{ border-color:var(--muted); }
+
+  figure{ margin:24px 0 0; }
+  .diagram-card{
+    background:var(--surface); border:1px solid var(--border); border-radius:12px;
+    overflow-x:auto; padding:8px;
+  }
+  .diagram-card svg{ display:block; width:1440px; max-width:none; height:auto; }
+  figcaption{
+    font-size:13px; color:var(--muted); margin-top:10px; max-width:70ch;
+  }
+
+  .notes{
+    display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr));
+    gap:16px; margin-top:28px;
+  }
+  .note{
+    background:var(--surface); border:1px solid var(--border); border-radius:10px;
+    padding:18px 20px;
+  }
+  .note h3{
+    font-size:14px; margin:0 0 8px; font-weight:600;
+  }
+  .note p{ font-size:13.5px; line-height:1.55; color:var(--muted); margin:0; }
+  .note.live h3{ color:var(--accent); }
+
+  footer{
+    margin-top:36px; padding-top:18px; border-top:1px solid var(--border);
+    font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--muted);
+  }
+
+  @media (max-width:640px){
+    .diagram-card svg{ width:1100px; }
+  }
+
+  @media print{
+    @page{ size: A4 landscape; margin: 12mm; }
+    body{ background:#fff; color:#141A20; }
+    .wrap{ max-width:none; }
+    .diagram-card{ overflow-x:visible; border:1px solid #B9C2C8; }
+    .diagram-card svg{ width:100%; height:auto; }
+    .notes{ page-break-inside:avoid; }
+    .note{ break-inside:avoid; }
+    footer{ page-break-before:avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="page">
+    <p class="eyebrow">MediSaarthi · System Architecture</p>
+    <h1>How a call becomes a care path</h1>
+    <p class="sub">Every box below is either built and running in this repo today, or it isn't yet — the border style says which. The red path is the one that has to resolve inside a single conversation turn; everything else can afford to be a webhook. This is MediSaarthi's own independent backend — nothing here is imported from Talkly.</p>
+  </header>
+
+  <div class="legend">
+    <div class="legend-item"><span class="swatch-box sw-reused"></span>Built and running in this repo</div>
+    <div class="legend-item"><span class="swatch-box sw-new"></span>Not built yet</div>
+    <div class="legend-item"><span class="swatch-line sw-live"></span>Live, in-call path — must resolve in one turn</div>
+    <div class="legend-item"><span class="swatch-line sw-async"></span>Async, post-call path</div>
+  </div>
+    <div class="legend cat-legend">
+      <div class="legend-item"><span class="swatch-box" style="background:var(--cat-tel-bg);border-color:var(--cat-tel)"></span>Telephony &amp; voice</div>
+      <div class="legend-item"><span class="swatch-box" style="background:var(--cat-safety-bg);border-color:var(--cat-safety)"></span>Safety / escalation</div>
+      <div class="legend-item"><span class="swatch-box" style="background:var(--cat-backend-bg);border-color:var(--cat-backend)"></span>Backend &amp; automation</div>
+      <div class="legend-item"><span class="swatch-box" style="background:var(--cat-frontend-bg);border-color:var(--cat-frontend)"></span>Frontend</div>
+      <div class="legend-item"><span class="swatch-box" style="background:var(--cat-data-bg);border-color:var(--cat-data)"></span>Data</div>
+      <div class="legend-item"><span class="swatch-box" style="background:var(--cat-external-bg);border-color:var(--cat-external)"></span>External integrations</div>
+    </div>
+
+  <figure>
+    <div class="diagram-card">
+<svg viewBox="0 0 1440 1000" width="1440" height="1000" role="img"
+     aria-label="Architecture diagram of MediSaarthi's own independent backend, showing a patient call entering through Twilio and the Bolna voice agent, a built post-call guardrail check, an aspirational live mid-call transfer to a supervisor that is not yet built, the MediSaarthi FastAPI backend and its built services, a single MongoDB database with collections that are all built but not yet tested live, a not-yet-built knowledge-grounding loop feeding hospital protocols back into the voice agent, and not-yet-built HIS/CRM and ABDM integrations.">
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/>
+    </marker>
+    <marker id="arrowLive" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/>
+    </marker>
+  </defs>
+
+  <line x1="160" y1="100" x2="160" y2="146" stroke="var(--muted)" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="170" y="128" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">dials in</text>
+
+  <line x1="270" y1="190" x2="336" y2="178" stroke="var(--muted)" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="300" y="142" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">SIP forward</text>
+
+  <polyline points="400,800 20,800 20,108 305,108 305,210 336,210"
+            fill="none" stroke="var(--accent-2)" stroke-width="2" stroke-dasharray="1 5" stroke-linecap="round"
+            marker-end="url(#arrow)"/>
+  <g>
+    <rect x="26" y="440" width="150" height="20" fill="var(--surface)"/>
+    <text x="28" y="455" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--accent-2)">RAG grounding — not built</text>
+  </g>
+
+  <line x1="450" y1="230" x2="450" y2="266" stroke="var(--muted)" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="458" y="252" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">post-call webhook</text>
+
+  <line x1="450" y1="360" x2="450" y2="456" stroke="var(--muted)" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="458" y="412" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">logs match</text>
+
+  <line x1="700" y1="230" x2="700" y2="267" stroke="var(--accent)" stroke-width="2.5" stroke-dasharray="1 4" marker-end="url(#arrowLive)"/>
+  <text x="708" y="252" font-family="IBM Plex Mono, monospace" font-size="11" font-weight="600" fill="var(--accent)">not built</text>
+
+  <polyline points="760,360 760,400 1050,400 1050,456" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="1 4" marker-end="url(#arrowLive)"/>
+  <text x="770" y="393" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--accent)">would alert live queue — not built</text>
+
+  <polyline points="1080,360 1080,445 860,445 860,460" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+  <g>
+    <rect x="895" y="432" width="110" height="20" fill="var(--surface)"/>
+    <text x="898" y="447" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">not built yet</text>
+  </g>
+
+  <polyline points="820,460 820,420 925,420 925,190 804,190" fill="none" stroke="var(--muted)" stroke-width="2" marker-end="url(#arrow)"/>
+  <g>
+    <rect x="828" y="400" width="172" height="20" fill="var(--surface)"/>
+    <text x="834" y="415" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">trigger call (built)</text>
+  </g>
+
+  <line x1="400" y1="720" x2="300" y2="796" stroke="var(--muted)" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="660" y1="720" x2="700" y2="796" stroke="var(--muted)" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="520" y="762" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)" text-anchor="middle">reads / writes</text>
+
+  <polyline points="820,720 820,760 1095,760 1095,796" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+  <text x="840" y="753" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">not built</text>
+
+  <polyline points="850,720 850,778 1315,778 1315,796" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+  <text x="1140" y="772" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">not built</text>
+
+  <line x1="958" y1="510" x2="864" y2="560" stroke="var(--muted)" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <rect x="50" y="30" width="220" height="70" rx="10" fill="var(--cat-tel-bg)" stroke="var(--cat-tel)" stroke-width="1.5"/>
+  <text x="160" y="60" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="15" font-weight="600" fill="var(--fg)">Patient</text>
+  <text x="160" y="80" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">calls the hospital line</text>
+
+  <rect x="50" y="150" width="220" height="80" rx="10" fill="var(--cat-tel-bg)" stroke="var(--cat-tel)" stroke-width="1.5"/>
+  <text x="160" y="185" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="15" font-weight="600" fill="var(--fg)">Twilio</text>
+  <text x="160" y="203" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">inbound SIP leg</text>
+  <text x="160" y="218" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--muted)">routers/inbound.py — built</text>
+
+  <rect x="340" y="150" width="460" height="80" rx="10" fill="var(--cat-tel-bg)" stroke="var(--cat-tel)" stroke-width="1.5"/>
+  <text x="358" y="177" font-family="IBM Plex Sans, sans-serif" font-size="15" font-weight="600" fill="var(--fg)">Bolna Voice Agent</text>
+  <text x="358" y="196" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">ASR · LLM · TTS, per hospital + language</text>
+  <rect x="580" y="202" width="202" height="22" rx="5" fill="none" stroke="var(--border-strong)" stroke-width="1.3" stroke-dasharray="4 3"/>
+  <text x="681" y="217" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--fg)">+ transfer tool — unconfirmed</text>
+
+  <rect x="340" y="270" width="220" height="90" rx="10" fill="var(--cat-safety-bg)" stroke="var(--cat-safety)" stroke-width="1.5"/>
+  <text x="450" y="298" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="14" font-weight="600" fill="var(--fg)">Guardrail check</text>
+  <text x="450" y="317" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">deterministic rule check</text>
+  <text x="450" y="331" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">(guardrail.py) — built</text>
+  <text x="450" y="349" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--muted)" font-style="italic">runs post-call today</text>
+
+  <rect x="630" y="270" width="260" height="90" rx="10" fill="none" stroke="var(--cat-safety)" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="760" y="298" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="14" font-weight="600" fill="var(--fg)">Supervisor</text>
+  <text x="760" y="317" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">would receive a live transfer</text>
+  <text x="760" y="331" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">mid-call — not built</text>
+  <text x="760" y="349" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--muted)" font-style="italic">needs Bolna mid-call support</text>
+
+  <rect x="960" y="270" width="240" height="90" rx="10" fill="none" stroke="var(--cat-backend)" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="1080" y="298" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="14" font-weight="600" fill="var(--fg)">Scheduled trigger</text>
+  <text x="1080" y="317" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">day-before reminders,</text>
+  <text x="1080" y="331" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">adherence cadence</text>
+  <text x="1080" y="349" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--muted)" font-style="italic">not built — manual trigger only</text>
+
+  <rect x="300" y="460" width="560" height="260" rx="12" fill="var(--cat-backend-bg)" stroke="var(--cat-backend)" stroke-width="1.5"/>
+  <text x="322" y="486" font-family="IBM Plex Sans, sans-serif" font-size="14" font-weight="600" fill="var(--fg)">MediSaarthi Backend</text>
+
+  <g>
+    <rect x="320" y="500" width="165" height="50" rx="7" fill="var(--surface)" stroke="var(--border-strong)" stroke-width="1.2"/>
+    <text x="402" y="522" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--fg)">auth</text>
+    <text x="402" y="538" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="var(--muted)">built</text>
+  </g>
+  <g>
+    <rect x="500" y="500" width="165" height="50" rx="7" fill="var(--surface)" stroke="var(--border-strong)" stroke-width="1.2"/>
+    <text x="582" y="522" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--fg)">patients</text>
+    <text x="582" y="538" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="var(--muted)">built</text>
+  </g>
+  <g>
+    <rect x="680" y="500" width="165" height="50" rx="7" fill="var(--surface)" stroke="var(--border-strong)" stroke-width="1.2"/>
+    <text x="762" y="522" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--fg)">protocols</text>
+    <text x="762" y="538" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="var(--muted)">built</text>
+  </g>
+
+  <g>
+    <rect x="320" y="565" width="165" height="50" rx="7" fill="var(--surface)" stroke="var(--border-strong)" stroke-width="1.2"/>
+    <text x="402" y="587" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--fg)">appointments</text>
+    <text x="402" y="603" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="var(--muted)">built, atomic</text>
+  </g>
+  <g>
+    <rect x="500" y="565" width="165" height="50" rx="7" fill="var(--surface)" stroke="var(--border-strong)" stroke-width="1.2"/>
+    <text x="582" y="587" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--fg)">inbound</text>
+    <text x="582" y="603" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="var(--muted)">built</text>
+  </g>
+  <g>
+    <rect x="680" y="565" width="165" height="50" rx="7" fill="var(--surface)" stroke="var(--border-strong)" stroke-width="1.2"/>
+    <text x="762" y="587" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--fg)">calls/trigger</text>
+    <text x="762" y="603" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="var(--muted)">built, manual</text>
+  </g>
+
+  <g>
+    <rect x="320" y="630" width="165" height="50" rx="7" fill="var(--surface)" stroke="var(--border-strong)" stroke-width="1.2"/>
+    <text x="402" y="652" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--fg)">calls/webhook</text>
+    <text x="402" y="668" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9.5" fill="var(--muted)">built</text>
+  </g>
+
+  <rect x="960" y="460" width="360" height="100" rx="10" fill="var(--cat-frontend-bg)" stroke="var(--cat-frontend)" stroke-width="1.5"/>
+  <text x="982" y="488" font-family="IBM Plex Sans, sans-serif" font-size="14" font-weight="600" fill="var(--fg)">Frontend Dashboard</text>
+  <text x="982" y="507" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--muted)">Next.js — patients &amp; appointments</text>
+  <rect x="982" y="520" width="190" height="24" rx="5" fill="none" stroke="var(--border-strong)" stroke-width="1.2" stroke-dasharray="4 3"/>
+  <text x="1077" y="536" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--fg)">+ live queue — not built</text>
+
+  <rect x="80" y="800" width="860" height="170" rx="10" fill="var(--cat-data-bg)" stroke="var(--cat-data)" stroke-width="1.5"/>
+  <text x="102" y="828" font-family="IBM Plex Sans, sans-serif" font-size="14" font-weight="600" fill="var(--fg)">MongoDB — medisaarthi</text>
+  <text x="102" y="852" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="var(--muted)">hospitals</text>
+  <text x="102" y="874" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="var(--muted)">users</text>
+  <text x="102" y="896" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="var(--muted)">patients</text>
+  <text x="102" y="918" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="var(--muted)">appointments</text>
+  <text x="320" y="852" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="var(--muted)">protocols</text>
+  <text x="320" y="874" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="var(--muted)">consent_records</text>
+  <text x="320" y="896" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="var(--muted)">audit_logs</text>
+  <text x="560" y="852" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="var(--muted)">redflag_events</text>
+  <text x="560" y="874" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="var(--muted)">phone_numbers</text>
+  <text x="560" y="896" font-family="IBM Plex Mono, monospace" font-size="11.5" fill="var(--muted)">calls</text>
+  <text x="102" y="945" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--accent-2)" font-style="italic">built — indexed, not yet exercised against a live database</text>
+
+  <rect x="1000" y="800" width="190" height="90" rx="10" fill="none" stroke="var(--cat-external)" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="1095" y="836" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13.5" font-weight="600" fill="var(--fg)">HIS / CRM connector</text>
+  <text x="1095" y="856" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">bespoke per hospital</text>
+
+  <rect x="1220" y="800" width="190" height="90" rx="10" fill="none" stroke="var(--cat-external)" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="1315" y="836" text-anchor="middle" font-family="IBM Plex Sans, sans-serif" font-size="13.5" font-weight="600" fill="var(--fg)">ABDM building blocks</text>
+  <text x="1315" y="856" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--muted)">external dependency</text>
+
+</svg>
+    </div>
+    <figcaption>Solid, filled boxes are built and running in this repo today. Dashed, outline boxes — and dashed red arrows — are not built yet. The live mid-call transfer is the one part of the system that has to work while the patient is still on the line, and it's the one piece not yet confirmed as buildable.</figcaption>
+  </figure>
+
+  <div class="notes">
+    <div class="note live">
+      <h3>The live path still isn't built</h3>
+      <p>The guardrail check (<code>guardrail.py</code>) is real and runs today — but only from the post-call webhook. The live, mid-call transfer depends on Bolna exposing a mid-call transfer/function-call tool, which hasn't been confirmed. That's still the first thing to verify.</p>
+    </div>
+    <div class="note">
+      <h3>Tenant isolation was rebuilt, not imported</h3>
+      <p>MediSaarthi has its own <code>auth.py</code> with the same pattern Talkly uses — a hospital is a tenant, every query scoped by <code>hospital_id</code> — but it's fresh code in this repo, not a shared import. No dependency on Talkly at runtime.</p>
+    </div>
+    <div class="note">
+      <h3>RAG grounding isn't built yet</h3>
+      <p>Protocols are stored (<code>protocols</code> collection, including each hospital's red-flag phrase list), but nothing retrieves them into a live Bolna call yet. Until that loop exists, "never diagnoses" is enforced only by what's in the prompt, not by what the agent can actually see.</p>
+    </div>
+  </div>
+
+  <footer>docs/architecture.html — built/not-built split verified against the MediSaarthi repo (../MediSaarthi/backend), not the pitch deck.</footer>
+
+</div>
+</body>
+</html>

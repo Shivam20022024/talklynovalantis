@@ -15,6 +15,10 @@ class OrderRequest(BaseModel):
 class VerifyRequest(BaseModel):
     order_id: str
 
+class TopUpRequest(BaseModel):
+    amount: float
+    description: str = "Wallet Recharge"
+
 @billing_router.get("/wallet")
 async def get_wallet_dashboard(current_user: dict = Depends(get_current_user)):
     db = mongodb.get_db()
@@ -35,10 +39,66 @@ async def get_usage(limit: int = 50, skip: int = 0, current_user: dict = Depends
     db = mongodb.get_db()
     cursor = db.usage_records.find({"company_id": current_user["company_id"]}).sort("created_at", -1).skip(skip).limit(limit)
     usage = []
+    call_ids = []
     async for u in cursor:
         u["_id"] = None
         usage.append(u)
+        if u.get("call_id"):
+            call_ids.append(u["call_id"])
+            
+    # Enrich with customer name and phone from calls collection
+    if call_ids:
+        calls = await db.calls.find({"call_id": {"$in": call_ids}}).to_list(len(call_ids))
+        call_map = {c["call_id"]: c for c in calls}
+        for u in usage:
+            cid = u.get("call_id")
+            if cid in call_map:
+                u["customer_name"] = call_map[cid].get("customer_name") or "Valued Customer"
+                u["phone"] = call_map[cid].get("customer_id") or ""
+                u["status"] = call_map[cid].get("status") or "Completed"
+                u["language"] = call_map[cid].get("language") or "English"
+
+    # Fallback: if usage_records was empty but calls exist, synthesize usage from completed calls
+    if not usage:
+        calls_cursor = db.calls.find({"company_id": current_user["company_id"]}).sort("created_at", -1).skip(skip).limit(limit)
+        async for c in calls_cursor:
+            dur = float(c.get("duration_seconds") or 0)
+            if dur < 5.0:
+                cost = 0.0
+                mins = 0.0
+            else:
+                cost = round(dur * 0.20, 2)
+                mins = round(dur / 60.0, 2)
+            usage.append({
+                "id": str(c.get("_id")),
+                "call_id": c.get("call_id"),
+                "customer_name": c.get("customer_name") or "Valued Customer",
+                "phone": c.get("customer_id") or "",
+                "duration_seconds": dur,
+                "billed_minutes": mins,
+                "customer_cost": cost,
+                "service_type": f"{c.get('direction', 'outbound')}_call",
+                "status": c.get("status") or "Completed",
+                "created_at": c.get("created_at")
+            })
+
     return usage
+
+@billing_router.post("/wallet/topup")
+async def direct_topup(req: TopUpRequest, current_user: dict = Depends(get_current_user)):
+    if req.amount <= 0:
+        raise HTTPException(status_code=400, detail="Recharge amount must be greater than 0")
+    import time
+    db = mongodb.get_db()
+    tx = await billing_service.add_credits(
+        db=db,
+        company_id=current_user["company_id"],
+        amount=float(req.amount),
+        payment_provider="direct_topup",
+        provider_transaction_id=f"topup_{int(time.time()*1000)}",
+        description=req.description or f"Wallet top-up (₹{req.amount})"
+    )
+    return {"status": "success", "message": f"Successfully credited ₹{req.amount} to your wallet.", "transaction": tx}
 
 @billing_router.post("/wallet/create-order")
 async def create_order(req: OrderRequest, current_user: dict = Depends(get_current_user)):

@@ -93,14 +93,15 @@ def _extract_json_object(text):
     except Exception: return None
 
 # -----------------------------------------
-# PROMPT CONSTANT
+# PROMPT CONSTANT (MULTI-INDUSTRY & BACKWARD-COMPATIBLE)
 # -----------------------------------------
 ANALYSIS_SYSTEM_PROMPT = """
-Analyze this real estate sales transcript and return a valid JSON object.
-Focus heavily on identifying buyer interest and specific property requirements.
+Analyze this customer conversation transcript and return a valid JSON object.
+Focus heavily on identifying buyer/prospect intent, specific requirements, and interest level across any industry (Real Estate, Healthcare, EdTech, BFSI/Loans, Retail, or B2B Services).
+
 CRITICAL SCORING RULES:
-1. If the customer states they are busy, hangs up quickly, or does not explicitly discuss property requirements, you MUST set the `lead_score` below 30, set `conversion_probability` below 10, and set `lead_temperature` to "Cold". Do not assume high intent without evidence.
-2. Conversely, if the customer provides explicit requirements (e.g., budget, location, property type) AND states an immediate or very urgent timeline (e.g., "tomorrow", "immediately", "this week"), you MUST set `lead_score` above 80, set `conversion_probability` above 70, and set `lead_temperature` to "Hot".
+1. If the customer states they are busy, hangs up quickly, expresses no interest, or does not explicitly engage in the conversation, you MUST set the `lead_score` below 30, set `conversion_probability` below 10, and set `lead_temperature` to "Cold". Do not assume high intent without evidence.
+2. Conversely, if the customer provides explicit requirements (e.g., product/service desired, budget, timeline, location, or scheduling preference) AND states an immediate or very urgent timeline (e.g., "tomorrow", "immediately", "this week", "book an appointment", "schedule demo"), you MUST set `lead_score` above 80, set `conversion_probability` above 70, and set `lead_temperature` to "Hot".
 
 The JSON schema must be:
 {
@@ -112,27 +113,34 @@ The JSON schema must be:
   "detected_language": "Initial language detected (e.g., Hindi, English, Tamil, Hinglish)",
   "preferred_language": "Language preferred by customer later in the call (if any switch occurred)",
   "transcript_language": "Primary language of this transcript text",
-  "intents": ["Purchase Inquiry", "Site Visit Request", "Price Negotiation"],
+  "intents": ["Inquiry", "Appointment Booking", "Pricing Request", "Follow-up Requested"],
   "lead_temperature": "Hot|Warm|Cold",
   "lead_score": 85,
-  "intent_label": "High Intent Buyer",
+  "intent_label": "High Intent Lead",
   "conversion_probability": 75,
-  "customer_name": "John Doe",
+  "customer_name": "Customer Name",
+  "requirements": {
+    "offering": "Property / Course / Specialty / Loan / Solution desired",
+    "budget": "Budget or price range mentioned",
+    "location": "City or Location mentioned",
+    "timeline": "Timeline or preferred time",
+    "details": "Other specific requirements mentioned"
+  },
   "property_requirements": {
-    "budget": "80L - 1.2Cr",
-    "location": "Sector 54",
-    "propertyType": "Flat",
-    "timeline": "3 months",
-    "loanRequired": true,
+    "budget": "Budget or price range",
+    "location": "Location if applicable",
+    "propertyType": "Type of product/property/offering",
+    "timeline": "Timeline",
+    "loanRequired": false,
     "investmentPurpose": "Self-Use"
   },
   "key_objections": [
     { "type": "Price", "severity": "Medium", "content": "Slightly over budget" }
   ],
   "follow_up_recommendations": [
-    { "type": "WhatsApp", "priority": "High", "content": "Send brochure", "draft": "Hi John, here is the brochure..." }
+    { "type": "WhatsApp", "priority": "High", "content": "Send details or brochure", "draft": "Hi, here is the information requested..." }
   ],
-  "action_items": ["Schedule site visit"],
+  "action_items": ["Schedule callback/appointment/demo"],
   "agent_performance": {
     "talkRatio": 0.45,
     "interruptionCount": 2,

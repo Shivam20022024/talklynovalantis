@@ -68,9 +68,10 @@ class FollowUpService:
                 print(f"FollowUp Generation OpenRouter Error: {e}")
 
         # Ultimate fallback
+        offering_text = context.get("offering") or "our discussion"
         return {
             "subject": "Following up on our conversation",
-            "body": f"Hi {context['customer_name']},\n\nThank you for taking the time to speak with me today. I wanted to follow up on our discussion regarding your property search.\n\nPlease let me know if you have any further questions.\n\nBest regards,\nAgent"
+            "body": f"Hi {context['customer_name']},\n\nThank you for taking the time to speak with me today. I wanted to follow up on our discussion regarding {offering_text}.\n\nPlease let me know if you have any further questions.\n\nBest regards,\nAgent"
         }
 
 followup_service = FollowUpService()

@@ -1,10 +1,8 @@
 import React from 'react';
 import { ArrowRight, Play, CheckCircle2 } from 'lucide-react';
-import Button from '../ui/Button';
-import { ViewState } from '../../types';
-
+import Button from '../ui/button';
 interface HeroProps {
-  onNavigate: (view: ViewState) => void;
+  onNavigate?: (view: any) => void;
 }
 
 const Hero: React.FC<HeroProps> = ({ onNavigate }) => {
@@ -43,7 +41,7 @@ const Hero: React.FC<HeroProps> = ({ onNavigate }) => {
           <Button 
             size="lg" 
             className="w-full sm:w-auto gap-2 group bg-primary-600 hover:bg-primary-700 shadow-md shadow-primary-500/20"
-            onClick={() => onNavigate('ANALYTICS')}
+            onClick={() => onNavigate && onNavigate('ANALYTICS')}
           >
             Try for free
             <ArrowRight size={18} className="group-hover:translate-x-1 transition-transform" />

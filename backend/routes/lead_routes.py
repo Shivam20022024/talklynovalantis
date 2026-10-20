@@ -26,13 +26,30 @@ async def create_lead(payload: dict = Body(...), current_user: dict = Depends(re
     db = mongodb.get_db()
     lead_id = str(uuid.uuid4())
 
+    offering = payload.get("offering") or payload.get("property") or ""
+    location = payload.get("location") or payload.get("city") or ""
+    custom_fields = payload.get("custom_fields") or {}
+
+    industry = payload.get("industry")
+    if not industry and campaign_id:
+        camp = await db.campaigns.find_one({"campaign_id": campaign_id, "company_id": current_user["company_id"]})
+        if camp:
+            industry = camp.get("industry")
+    if not industry:
+        comp = await db.companies.find_one({"company_id": current_user["company_id"]})
+        if comp:
+            industry = comp.get("industry", "general_sales")
+
     doc = {
         "lead_id": lead_id,
         "campaign_id": campaign_id,
         "name": name or "Unknown",
         "phone": phone,
-        "property": payload.get("property", ""),
-        "location": payload.get("location", ""),
+        "offering": offering,
+        "property": offering,
+        "location": location,
+        "industry": industry,
+        "custom_fields": custom_fields,
         "status": "New",
         "aiScore": 0,
         "lastContact": None,
@@ -74,10 +91,17 @@ async def upload_leads_csv(
     company_id = current_user["company_id"]
 
     # If a campaign_id is supplied, verify it belongs to this company.
+    campaign_industry = None
     if campaign_id:
         owned = await db.campaigns.find_one({"campaign_id": campaign_id, "company_id": company_id})
         if not owned:
             raise HTTPException(status_code=404, detail="Campaign not found")
+        campaign_industry = owned.get("industry")
+    
+    if not campaign_industry:
+        comp = await db.companies.find_one({"company_id": company_id})
+        if comp:
+            campaign_industry = comp.get("industry", "general_sales")
 
     docs = []
 
@@ -89,14 +113,40 @@ async def upload_leads_csv(
         if not phone:
             continue
 
+        offering = (
+            row.get("Offering") or row.get("offering") or 
+            row.get("Product") or row.get("product") or 
+            row.get("Service") or row.get("service") or 
+            row.get("Course") or row.get("course") or 
+            row.get("Program") or row.get("program") or 
+            row.get("Property") or row.get("property") or 
+            row.get("Loan Type") or row.get("loan type") or row.get("Loan") or row.get("loan") or 
+            row.get("Specialty") or row.get("specialty") or row.get("Doctor") or row.get("doctor") or 
+            row.get("Plan") or row.get("plan") or ""
+        )
+        location = row.get("Location") or row.get("location") or row.get("City") or row.get("city") or ""
+        row_industry = row.get("industry") or row.get("Industry") or campaign_industry
+
+        # Collect any extra columns into custom_fields for dynamic prompt variable injection
+        reserved_keys = {
+            "name", "phone", "customer name", "phone number", 
+            "property", "offering", "product", "service", "course", "program",
+            "loan type", "loan", "specialty", "doctor", "plan",
+            "location", "city", "industry"
+        }
+        custom_fields = {str(k): v for k, v in row.items() if str(k).strip().lower() not in reserved_keys and v is not None}
+
         docs.append({
             "lead_id": str(uuid.uuid4()),
             "company_id": company_id,
             "campaign_id": campaign_id,
             "name": name,
             "phone": phone,
-            "property": row.get("Property", ""),
-            "location": row.get("Location", ""),
+            "offering": offering,
+            "property": offering,
+            "location": location,
+            "industry": row_industry,
+            "custom_fields": custom_fields,
             "status": "New",
             "aiScore": 0,
             "lastContact": None,
@@ -114,13 +164,16 @@ async def upload_leads_csv(
     return {"status": "success", "inserted_count": len(docs)}
 
 @lead_router.get("/leads")
-async def list_leads(campaign_id: str = None, range: str = None, current_user: dict = Depends(require_company_access)):
+async def list_leads(campaign_id: str = None, range: str = None, industry: str = None, current_user: dict = Depends(require_company_access)):
     from datetime import timedelta
     db = mongodb.get_db()
     query = tenant_filter(current_user)
 
     if campaign_id:
         query["campaign_id"] = campaign_id
+
+    if industry and industry.lower() != "all":
+        query["industry"] = industry.lower()
 
     if range and range != "All Time":
         today = datetime.utcnow()

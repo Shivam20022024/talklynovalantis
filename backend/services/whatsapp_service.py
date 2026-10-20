@@ -1,0 +1,244 @@
+import os
+import re
+import datetime
+import requests
+from starlette.concurrency import run_in_threadpool
+
+class WhatsAppService:
+    """
+    Service for automated WhatsApp messaging via Meta WhatsApp Cloud API.
+    Sends reminders, booking confirmations, and brochures directly to leads after calls.
+    """
+
+    def clean_phone_number(self, phone: str) -> str:
+        """Sanitizes phone number into international format without '+' for Meta API (e.g., 919877082909)."""
+        if not phone:
+            return ""
+        digits = re.sub(r"\D", "", str(phone))
+        # If standard 10-digit Indian number without country code, prepend 91
+        if len(digits) == 10:
+            digits = "91" + digits
+        return digits
+
+    async def get_whatsapp_credentials(self, db, company_id: str) -> dict:
+        """Retrieves WhatsApp configuration for the company, falling back to environment variables."""
+        config = {
+            "enabled": True,
+            "provider": "meta_cloud",
+            "phone_number_id": os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "").strip(),
+            "access_token": os.environ.get("WHATSAPP_ACCESS_TOKEN", "").strip()
+        }
+
+        if company_id:
+            company = await db.companies.find_one({"company_id": company_id})
+            if company and company.get("whatsapp_config"):
+                w_cfg = company["whatsapp_config"]
+                if w_cfg.get("phone_number_id"):
+                    config["phone_number_id"] = w_cfg.get("phone_number_id").strip()
+                if w_cfg.get("access_token"):
+                    config["access_token"] = w_cfg.get("access_token").strip()
+                if "enabled" in w_cfg:
+                    config["enabled"] = bool(w_cfg["enabled"])
+
+        return config
+
+    async def send_meta_whatsapp_message(self, phone_number_id: str, access_token: str, recipient_phone: str, message_body: str) -> dict:
+        """Calls the Meta WhatsApp Cloud API to send a text message."""
+        clean_recipient = self.clean_phone_number(recipient_phone)
+        if not clean_recipient:
+            return {"status": "error", "message": "Invalid recipient phone number"}
+
+        url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": clean_recipient,
+            "type": "text",
+            "text": {
+                "preview_url": True,
+                "body": message_body
+            }
+        }
+
+        def _send():
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=15)
+                return response.status_code, response.text
+            except Exception as e:
+                return 500, str(e)
+
+        status_code, response_text = await run_in_threadpool(_send)
+
+        if status_code in [200, 201]:
+            try:
+                import json
+                resp_json = json.loads(response_text)
+                msg_id = resp_json.get("messages", [{}])[0].get("id")
+                return {"status": "success", "message_id": msg_id, "recipient": clean_recipient}
+            except Exception:
+                return {"status": "success", "response": response_text, "recipient": clean_recipient}
+        else:
+            return {"status": "error", "status_code": status_code, "detail": response_text}
+
+    async def send_meta_whatsapp_template(self, phone_number_id: str, access_token: str, recipient_phone: str, template_name: str = "hello_world", language_code: str = "en_US") -> dict:
+        """Calls the Meta WhatsApp Cloud API to send a pre-approved template message."""
+        clean_recipient = self.clean_phone_number(recipient_phone)
+        if not clean_recipient:
+            return {"status": "error", "message": "Invalid recipient phone number"}
+
+        url = f"https://graph.facebook.com/v19.0/{phone_number_id}/messages"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": clean_recipient,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": language_code}
+            }
+        }
+
+        def _send():
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=15)
+                return response.status_code, response.text
+            except Exception as e:
+                return 500, str(e)
+
+        status_code, response_text = await run_in_threadpool(_send)
+
+        if status_code in [200, 201]:
+            try:
+                import json
+                resp_json = json.loads(response_text)
+                msg_id = resp_json.get("messages", [{}])[0].get("id")
+                return {"status": "success", "message_id": msg_id, "recipient": clean_recipient}
+            except Exception:
+                return {"status": "success", "response": response_text, "recipient": clean_recipient}
+        else:
+            return {"status": "error", "status_code": status_code, "detail": response_text}
+
+    async def process_post_call_whatsapp(self, db, call_id: str):
+        """
+        Triggered automatically when a call finishes analysis.
+        Checks if the customer asked for WhatsApp or scheduled an appointment/demo,
+        constructs the personalized reminder, and sends it via WhatsApp.
+        """
+        try:
+            call = await db.calls.find_one({"call_id": call_id})
+            if not call:
+                return
+
+            company_id = call.get("company_id")
+            creds = await self.get_whatsapp_credentials(db, company_id)
+
+            if not creds.get("enabled"):
+                return
+
+            analysis = call.get("analysis") or {}
+            intents = analysis.get("intents") or []
+            summary = (analysis.get("summary") or "").lower()
+            action_items = [str(a).lower() for a in analysis.get("action_items") or []]
+            reqs = analysis.get("requirements") or analysis.get("property_requirements") or {}
+            timeline = reqs.get("timeline") or ""
+
+            # Check if WhatsApp was requested or appointment/demo confirmed
+            whatsapp_needed = (
+                any("whatsapp" in item for item in action_items)
+                or any("whatsapp" in s for s in [summary])
+                or "Follow-up Requested" in intents
+                or "Appointment Booking" in intents
+                or "Demo Booking" in intents
+                or any(k in summary for k in ["confirmed participation", "confirmed demo", "confirmed seat", "details via whatsapp"])
+            )
+
+            if not whatsapp_needed:
+                return
+
+            # Resolve customer phone
+            customer_phone = call.get("customer_id") or call.get("phone_number")
+            if not customer_phone:
+                lead = await db.leads.find_one({"lead_id": call_id})
+                if lead:
+                    customer_phone = lead.get("phone")
+
+            if not customer_phone:
+                return
+
+            customer_name = call.get("customer_name") or "Valued Customer"
+            company = await db.companies.find_one({"company_id": company_id})
+            company_name = company.get("name") if company else "TalklyAI"
+            offering = reqs.get("offering") or call.get("offering") or "Session"
+
+            # Check if AI generated a tailored draft
+            draft_text = ""
+            for rec in analysis.get("follow_up_recommendations") or []:
+                if rec.get("type", "").lower() == "whatsapp" and rec.get("draft"):
+                    draft_text = rec.get("draft")
+                    break
+
+            # Fallback message template if no custom draft
+            if not draft_text:
+                if timeline:
+                    draft_text = (
+                        f"नमस्ते {customer_name}! {company_name} की तरफ से धन्यवाद।\n\n"
+                        f"आपकी {offering} की सीट कन्फर्म हो गई है:\n"
+                        f"🗓 समय: {timeline}\n\n"
+                        f"हम आपसे सत्र में मिलने के लिए उत्सुक हैं! यदि कोई प्रश्न हो तो इस संदेश का उत्तर दें।"
+                    )
+                else:
+                    draft_text = (
+                        f"नमस्ते {customer_name}! {company_name} की तरफ से धन्यवाद।\n\n"
+                        f"आपके अनुरोध के अनुसार {offering} की सभी जानकारी और विवरण यहाँ साझा किए जा रहे हैं।\n\n"
+                        f"कृपया हमें बताएं यदि आप किसी अन्य सहायता की आवश्यकता है!"
+                    )
+
+            # If Meta Cloud API keys are configured, send real message
+            phone_number_id = creds.get("phone_number_id")
+            access_token = creds.get("access_token")
+
+            if phone_number_id and access_token:
+                result = await self.send_meta_whatsapp_message(
+                    phone_number_id, access_token, customer_phone, draft_text
+                )
+                delivery_status = "sent" if result.get("status") == "success" else "failed"
+                message_id = result.get("message_id")
+            else:
+                # Simulation mode (credentials not added yet)
+                delivery_status = "simulated"
+                message_id = f"sim_{int(datetime.datetime.utcnow().timestamp())}"
+                print(f"[WhatsApp Automation] Meta API credentials not set. Simulated sending to {customer_phone}:\n{draft_text}")
+
+            now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+            whatsapp_record = {
+                "whatsapp_sent": True,
+                "whatsapp_status": delivery_status,
+                "whatsapp_message_id": message_id,
+                "whatsapp_recipient": customer_phone,
+                "whatsapp_message_body": draft_text,
+                "whatsapp_timestamp": now_iso
+            }
+
+            # Update call and lead records
+            await db.calls.update_one({"call_id": call_id}, {"$set": whatsapp_record})
+            await db.leads.update_one(
+                {"$or": [{"lead_id": call_id}, {"phone": customer_phone}]},
+                {"$set": {
+                    "whatsapp_sent": True,
+                    "whatsapp_last_sent": now_iso,
+                    "whatsapp_status": delivery_status
+                }}
+            )
+
+            print(f"[WhatsApp Automation] Dispatched automated reminder to {customer_phone} (Status: {delivery_status})")
+        except Exception as e:
+            print(f"[WhatsApp Automation Error] {e}")
+
+whatsapp_service = WhatsAppService()

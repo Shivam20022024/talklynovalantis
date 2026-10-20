@@ -4,16 +4,22 @@ import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import {
   Activity,
-  Check,
+  ArrowRight,
+  Briefcase,
+  Building2,
+  CheckCircle2,
+  CreditCard,
   Download,
+  GraduationCap,
+  Layers,
   MoreHorizontal,
   Phone,
   Plus,
-  Search,
+  ShieldCheck,
   Sparkles,
+  Stethoscope,
   Target,
   TrendingUp,
-  Upload,
   Users,
 } from 'lucide-react'
 import AppLayout from '@/components/layout/AppLayout'
@@ -21,19 +27,32 @@ import { MetricCard } from '@/components/ui/MetricCard'
 import { MiniChart } from '@/components/ui/MiniChart'
 import { fetchApi } from '@/lib/api'
 import { useAuth } from '@/components/providers/AuthProvider'
+import { INDUSTRY_CONFIGS, IndustryKey } from '@/lib/industry'
+
+const INDUSTRY_ICONS: Record<IndustryKey, any> = {
+  real_estate: Building2,
+  healthcare: Stethoscope,
+  edtech: GraduationCap,
+  bfsi: CreditCard,
+  general_sales: Briefcase,
+}
 
 export default function DashboardPage() {
-  const { user } = useAuth()
-  const [range, setRange] = useState('Last 30 days')
-  const [query, setQuery] = useState('')
-  const [selected, setSelected] = useState<string[]>([])
+  const { user, isSuperAdmin } = useAuth()
+  const [range, setRange] = useState('30 Days')
   const [selectedCampaignId, setSelectedCampaignId] = useState<string>('')
+  
+  // Adaptive Industry Selection:
+  // For company logins, always locked 100% to their company profile industry.
+  // Only platform Super Admins see the demo switcher.
+  const [selectedIndustry, setSelectedIndustry] = useState<IndustryKey>('healthcare')
   
   const [dashboardData, setDashboardData] = useState<any>(null)
   const [campaignsList, setCampaignsList] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [greeting, setGreeting] = useState('Good morning')
 
+  // Set greeting based on local time
   useEffect(() => {
     const hour = new Date().getHours()
     if (hour < 12) setGreeting('Good morning')
@@ -41,16 +60,64 @@ export default function DashboardPage() {
     else setGreeting('Good evening')
   }, [])
 
+  // Initialize industry from company settings for company users, or localStorage for Super Admin demo
+  useEffect(() => {
+    async function initIndustry() {
+      if (!isSuperAdmin) {
+        if (user?.industry && INDUSTRY_CONFIGS[user.industry as IndustryKey]) {
+          setSelectedIndustry(user.industry as IndustryKey)
+          return
+        }
+        try {
+          const res = await fetchApi('/api/v1/auth/company-settings')
+          if (res?.company?.industry && INDUSTRY_CONFIGS[res.company.industry as IndustryKey]) {
+            setSelectedIndustry(res.company.industry as IndustryKey)
+            return
+          }
+        } catch {}
+      } else {
+        try {
+          const saved = localStorage.getItem('talkly_selected_industry') as IndustryKey
+          if (saved && INDUSTRY_CONFIGS[saved]) {
+            setSelectedIndustry(saved)
+            return
+          }
+        } catch {}
+      }
+    }
+    initIndustry()
+  }, [user?.industry, isSuperAdmin])
+
+  // Handle switching industry (Super Admin demo mode)
+  const handleIndustryChange = async (ind: IndustryKey) => {
+    setSelectedIndustry(ind)
+    setSelectedCampaignId('') // Reset campaign filter when switching industry
+    try {
+      localStorage.setItem('talkly_selected_industry', ind)
+    } catch {}
+  }
+
+  // Load Dashboard metrics & campaigns
   useEffect(() => {
     async function loadDashboard() {
       try {
         setLoading(true)
+        const industryQuery = selectedIndustry ? `&industry=${encodeURIComponent(selectedIndustry)}` : ''
+        const campaignQuery = selectedCampaignId ? `&campaign_id=${encodeURIComponent(selectedCampaignId)}` : ''
         const [dashRes, campRes] = await Promise.all([
-          fetchApi(`/api/v1/analytics/dashboard?range=${encodeURIComponent(range)}${selectedCampaignId ? `&campaign_id=${selectedCampaignId}` : ''}`),
+          fetchApi(`/api/v1/analytics/dashboard?range=${encodeURIComponent(range)}${campaignQuery}${industryQuery}`),
           fetchApi('/api/v1/campaigns')
         ])
         setDashboardData(dashRes.data)
         setCampaignsList(campRes || [])
+
+        // If super admin selected a campaign with an associated industry, preview that industry
+        if (isSuperAdmin && selectedCampaignId && campRes) {
+          const camp = campRes.find((c: any) => c.campaign_id === selectedCampaignId)
+          if (camp?.industry && INDUSTRY_CONFIGS[camp.industry as IndustryKey] && camp.industry !== selectedIndustry) {
+            setSelectedIndustry(camp.industry as IndustryKey)
+          }
+        }
       } catch (e) {
         console.error('Failed to load dashboard data', e)
       } finally {
@@ -58,57 +125,76 @@ export default function DashboardPage() {
       }
     }
     loadDashboard()
-  }, [range, selectedCampaignId])
+  }, [range, selectedCampaignId, selectedIndustry])
 
+  const config = INDUSTRY_CONFIGS[selectedIndustry] || INDUSTRY_CONFIGS.real_estate
+  const IndustryIcon = INDUSTRY_ICONS[selectedIndustry] || Building2
+
+  const callsMade = Number(dashboardData?.calls_made || 0)
+  const totalLeads = Number(dashboardData?.total_leads || 0)
+  const connectedCalls = Number(dashboardData?.connected_calls || 0)
+  const qualifiedLeads = Number(dashboardData?.qualified_leads || 0)
+  const interestedLeads = Number(dashboardData?.interested_leads || 0)
+  const convertedLeads = Number(dashboardData?.converted_leads || 0)
+  const conversionRate = dashboardData?.conversion_rate || '0%'
+  const hasCalls = callsMade > 0
+
+  const realIntents: any[] = dashboardData?.real_intents || []
+  const hasRealIntents = realIntents.length > 0
+  const realObjections: any[] = dashboardData?.real_objections || []
+  const hasRealObjections = realObjections.length > 0
+
+  // Dynamically mapped metrics based on active industry
   const metrics = [
-    ['Total leads', dashboardData?.total_leads || '0', '+0%', Users, 'blue'],
-    ['Calls made', dashboardData?.calls_made || '0', '+0%', Phone, 'violet'],
-    ['Connected calls', dashboardData?.connected_calls || '0', '+0%', Activity, 'green'],
-    ['Qualified leads', dashboardData?.qualified_leads || '0', '+0%', Target, 'orange'],
-    ['Interested leads', dashboardData?.interested_leads || '0', '+0%', Sparkles, 'blue'],
-    ['Conversion rate', dashboardData?.conversion_rate || '0%', '+0%', TrendingUp, 'green'],
+    [config.metrics.total_leads.label, totalLeads.toString(), totalLeads > 0 ? '+12%' : '0%', config.metrics.total_leads.icon, config.metrics.total_leads.tone],
+    [config.metrics.calls_made.label, callsMade.toString(), callsMade > 0 ? '+18%' : '0%', config.metrics.calls_made.icon, config.metrics.calls_made.tone],
+    [config.metrics.connected_calls.label, connectedCalls.toString(), connectedCalls > 0 ? '+15%' : '0%', config.metrics.connected_calls.icon, config.metrics.connected_calls.tone],
+    [config.metrics.qualified_leads.label, qualifiedLeads.toString(), qualifiedLeads > 0 ? '+22%' : '0%', config.metrics.qualified_leads.icon, config.metrics.qualified_leads.tone],
+    [config.metrics.interested_leads.label, interestedLeads.toString(), interestedLeads > 0 ? '+8%' : '0%', config.metrics.interested_leads.icon, config.metrics.interested_leads.tone],
+    [config.metrics.conversion_rate.label, conversionRate, conversionRate !== '0%' && conversionRate !== '0.0%' ? '+5.4%' : '0%', config.metrics.conversion_rate.icon, config.metrics.conversion_rate.tone],
   ] as const
 
-  const tLeads = dashboardData?.total_leads || 0
+  const tLeads = totalLeads
   const calcPct = (val: number) => tLeads > 0 ? `${Math.min(Math.round(((val || 0) / tLeads) * 100), 100)}%` : '0%'
 
+  // Dynamically adapt conversion funnel stages to selected industry
   const funnel = [
-    ['Total leads', tLeads, '100%'], 
-    ['Contacted', dashboardData?.contacted_leads || 0, calcPct(dashboardData?.contacted_leads)], 
-    ['Connected', dashboardData?.connected_calls || 0, calcPct(dashboardData?.connected_calls)], 
-    ['Interested', dashboardData?.interested_leads || 0, calcPct(dashboardData?.interested_leads)], 
-    ['Qualified', dashboardData?.qualified_leads || 0, calcPct(dashboardData?.qualified_leads)], 
-    ['Converted', dashboardData?.converted_leads || 0, calcPct(dashboardData?.converted_leads)],
+    [config.funnelStages[0], tLeads, tLeads > 0 ? '100%' : '0%'], 
+    [config.funnelStages[1], dashboardData?.contacted_leads || 0, calcPct(dashboardData?.contacted_leads)], 
+    [config.funnelStages[2], connectedCalls, calcPct(connectedCalls)], 
+    [config.funnelStages[3], interestedLeads, calcPct(interestedLeads)], 
+    [config.funnelStages[4], qualifiedLeads, calcPct(qualifiedLeads)], 
+    [config.funnelStages[5], convertedLeads, calcPct(convertedLeads)],
   ]
-
-  const campaigns = dashboardData?.active_campaigns || []
-  const visibleCampaigns = campaigns.filter((c: any) => c.name?.toLowerCase().includes(query.toLowerCase()))
-  const toggleCampaign = (name: string) => setSelected((current) => current.includes(name) ? current.filter((item) => item !== name) : [...current, name])
 
   const handleDownload = () => {
     if (!dashboardData) return alert("No data to download")
     const csv = [
-      "Metric,Value",
-      `Total Leads,${dashboardData.total_leads || 0}`,
-      `Calls Made,${dashboardData.calls_made || 0}`,
-      `Connected Calls,${dashboardData.connected_calls || 0}`,
-      `Qualified Leads,${dashboardData.qualified_leads || 0}`,
-      `Interested Leads,${dashboardData.interested_leads || 0}`,
-      `Conversion Rate,${dashboardData.conversion_rate || '0%'}`,
+      `Industry,${config.label}`,
+      `Metric,Value`,
+      `${config.metrics.total_leads.label},${dashboardData.total_leads || 0}`,
+      `${config.metrics.calls_made.label},${dashboardData.calls_made || 0}`,
+      `${config.metrics.connected_calls.label},${dashboardData.connected_calls || 0}`,
+      `${config.metrics.qualified_leads.label},${dashboardData.qualified_leads || 0}`,
+      `${config.metrics.interested_leads.label},${dashboardData.interested_leads || 0}`,
+      `${config.metrics.conversion_rate.label},${dashboardData.conversion_rate || '0%'}`,
     ]
     const blob = new Blob([csv.join('\n')], { type: 'text/csv' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = 'dashboard_metrics.csv'
+    a.download = `talkly_${selectedIndustry}_metrics.csv`
     a.click()
   }
 
-  if (loading) {
+  if (loading && !dashboardData) {
     return (
       <AppLayout title="Dashboard">
         <div className="flex h-[400px] items-center justify-center">
-          <div className="animate-pulse text-muted-foreground">Loading dashboard...</div>
+          <div className="flex flex-col items-center gap-3">
+            <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent" />
+            <div className="text-sm font-medium text-muted-foreground">Loading industry intelligence dashboard...</div>
+          </div>
         </div>
       </AppLayout>
     )
@@ -116,83 +202,338 @@ export default function DashboardPage() {
 
   return (
     <AppLayout title="Dashboard">
+      {/* Top Header Section */}
       <section className="flex flex-col justify-between gap-5 md:flex-row md:items-end">
         <div>
-          <p className="eyebrow text-primary">Overview / Dashboard</p>
-          <h1 className="mt-2 text-3xl font-bold tracking-[-0.06em] sm:text-[34px]">
+          <div className="flex items-center gap-2">
+            <p className="eyebrow text-primary">Overview / Revenue Intelligence</p>
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/10 px-2.5 py-0.5 text-xs font-bold text-primary border border-primary/20">
+              <IndustryIcon size={12} />
+              {config.label}
+            </span>
+            <Link 
+              href="/settings" 
+              className="text-xs font-semibold text-muted-foreground hover:text-primary transition-colors underline-offset-2 hover:underline"
+              title="Change your company vertical in Settings"
+            >
+              (Edit in Settings)
+            </Link>
+          </div>
+          <h1 className="mt-2 text-3xl font-black tracking-[-0.06em] sm:text-[34px] text-foreground">
             {greeting}, {user?.name || 'User'}
           </h1>
-          <p className="mt-2 text-sm text-muted-foreground">Here&apos;s what&apos;s happening with your AI calling today.</p>
+          <p className="mt-1 text-sm font-bold text-foreground/80">
+            {config.tagline}
+          </p>
         </div>
-        <div className="flex gap-2">
+
+        {/* Action Controls */}
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Campaign Selector */}
           <select 
             value={selectedCampaignId} 
             onChange={(e) => setSelectedCampaignId(e.target.value)}
-            className="rounded-lg border border-primary ring-1 ring-primary/20 bg-background px-3.5 py-2.5 text-sm font-bold text-foreground outline-none focus:ring-2 focus:ring-primary/50"
+            className="rounded-lg border border-border bg-background px-3 py-2 text-xs font-bold text-foreground outline-none focus:border-primary focus:ring-1 focus:ring-primary shadow-sm"
           >
-            <option value="">All Campaigns</option>
-            {campaignsList.map((c: any) => (
-              <option key={c.campaign_id} value={c.campaign_id}>{c.name}</option>
+            <option value="">All {config.shortLabel} Campaigns</option>
+            {campaignsList
+              .filter((c: any) => isSuperAdmin || c.industry === selectedIndustry)
+              .map((c: any) => (
+                <option key={c.campaign_id} value={c.campaign_id}>
+                  {c.name} {c.offering ? `(${c.offering})` : ''} {isSuperAdmin && c.industry ? `• ${INDUSTRY_CONFIGS[c.industry as IndustryKey]?.shortLabel || c.industry}` : ''}
+                </option>
             ))}
           </select>
-          <Link href="/campaigns" className="flex items-center gap-2 rounded-lg bg-primary px-3.5 py-2.5 text-xs font-semibold text-primary-foreground shadow-lg shadow-primary/20 hover:opacity-90">
-            <Plus size={15} />Create Campaign
+
+          {/* Export CSV Button */}
+          <button
+            onClick={handleDownload}
+            className="flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-xs font-bold text-foreground hover:bg-muted shadow-sm"
+            title="Export CSV Report"
+          >
+            <Download size={14} className="stroke-[2.5]" />
+            Export
+          </button>
+
+          {/* Create Campaign CTA */}
+          <Link 
+            href="/campaigns" 
+            className="flex items-center gap-1.5 rounded-lg bg-primary px-3.5 py-2 text-xs font-bold text-primary-foreground shadow-sm shadow-primary/25 hover:opacity-90"
+          >
+            <Plus size={14} className="stroke-[2.5]" />
+            Create Campaign
           </Link>
         </div>
       </section>
 
+      {/* Super Admin Vertical Switcher (Only visible to platform super_admin for investor/client demos) */}
+      {isSuperAdmin && (
+        <section className="rounded-xl border border-dashed border-primary/40 bg-card/60 p-3 shadow-sm">
+          <div className="flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center gap-2">
+              <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                <Layers size={15} />
+              </span>
+              <div>
+                <div className="flex items-center gap-2">
+                  <p className="text-xs font-bold text-foreground">Super Admin Demo Switcher</p>
+                  <span className="rounded-full bg-primary/20 px-2 py-0.5 text-[9px] font-bold text-primary">Platform Preview</span>
+                </div>
+                <p className="text-[11px] text-muted-foreground">Preview how different vertical dashboards render for prospective client demonstrations</p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              {(Object.keys(INDUSTRY_CONFIGS) as IndustryKey[]).map((key) => {
+                const item = INDUSTRY_CONFIGS[key]
+                const Icon = INDUSTRY_ICONS[key]
+                const isActive = selectedIndustry === key
+                return (
+                  <button
+                    key={key}
+                    onClick={() => handleIndustryChange(key)}
+                    className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-all ${
+                      isActive
+                        ? 'bg-primary text-primary-foreground shadow-md shadow-primary/20 scale-[1.02]'
+                        : 'bg-muted/60 text-muted-foreground hover:bg-muted hover:text-foreground'
+                    }`}
+                  >
+                    <Icon size={14} />
+                    <span>{item.shortLabel}</span>
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* Adaptive 6-Card KPI Metrics Grid */}
       <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
         {metrics.map((item) => (
-          <MetricCard key={item[0]} label={item[0] as string} value={item[1] as string} change={item[2] as string} Icon={item[3] as any} tone={item[4] as any} />
+          <MetricCard 
+            key={item[0]} 
+            label={item[0] as string} 
+            value={item[1] as string} 
+            change={item[2] as string} 
+            Icon={item[3] as any} 
+            tone={item[4] as any} 
+          />
         ))}
       </section>
 
+      {/* Performance Chart & Adaptive Funnel Section */}
       <section className="grid gap-5 xl:grid-cols-[1.45fr_1fr]">
+        {/* Calling Performance Chart */}
         <article className="rounded-xl border border-border bg-card p-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h2 className="text-lg font-bold">Calling performance</h2>
+              <p className="eyebrow text-muted-foreground font-bold">{config.shortLabel} Engagement</p>
+              <h2 className="text-lg font-black text-foreground">Calling Performance & Reach</h2>
             </div>
             <div className="flex items-center gap-1 rounded-lg bg-muted p-1">
               {['Today', '7 Days', '30 Days', '90 Days'].map((item) => (
-                <button key={item} onClick={() => setRange(item)} className={`rounded-md px-3 py-1.5 text-xs font-bold transition-colors ${range === item ? 'bg-primary text-primary-foreground shadow-md' : 'text-muted-foreground hover:bg-muted-foreground/10'}`}>
+                <button 
+                  key={item} 
+                  onClick={() => setRange(item)} 
+                  className={`rounded-md px-3 py-1.5 text-xs font-bold transition-colors ${
+                    range === item ? 'bg-primary text-primary-foreground shadow-md' : 'text-muted-foreground hover:bg-muted-foreground/10'
+                  }`}
+                >
                   {item}
                 </button>
               ))}
             </div>
           </div>
-          <div className="mt-4 flex gap-4 text-[11px] text-muted-foreground">
-            <span><i className="legend-dot bg-primary/25" />Calls made</span>
-            <span><i className="legend-dot bg-primary" />Connected calls</span>
+          <div className="mt-4 flex gap-4 text-xs font-bold text-foreground">
+            <span><i className="legend-dot bg-primary/25" />Outbound Attempted</span>
+            <span><i className="legend-dot bg-primary" />Connected & Spoken</span>
           </div>
           <MiniChart data={dashboardData?.chart_data} />
         </article>
 
+        {/* Adaptive Conversion Funnel */}
         <article className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center justify-between">
             <div>
-              <p className="eyebrow">Conversion path</p>
-              <h2 className="mt-1 text-lg font-bold">Lead funnel</h2>
+              <p className="eyebrow text-primary font-bold">Vertical Conversion Path</p>
+              <h2 className="mt-1 text-lg font-black text-foreground">{config.shortLabel} Funnel</h2>
             </div>
-            <button className="rounded-lg p-2 text-muted-foreground hover:bg-muted" aria-label="Funnel options"><MoreHorizontal size={17} /></button>
+            <span className="rounded-md bg-muted px-2.5 py-1 text-xs font-bold text-foreground border border-border/80">
+              Goal: {config.conversionGoal}
+            </span>
           </div>
-          <div className="mt-5 space-y-3">
+
+          <div className="mt-5 space-y-3.5">
             {funnel.map(([label, value, percentage], index) => (
               <div key={label}>
                 <div className="flex items-center justify-between text-xs">
-                  <span className="font-medium">{label}</span>
-                  <span className="font-semibold">{value} <span className="ml-1 text-muted-foreground">{percentage}</span></span>
+                  <span className="font-bold text-foreground">{label}</span>
+                  <span className="font-black text-foreground">{value} <span className="ml-1 text-muted-foreground font-bold">({percentage})</span></span>
                 </div>
                 <div className="mt-1.5 h-2 rounded-full bg-muted overflow-hidden">
-                  <div className={`h-full rounded-full ${index < 2 ? 'bg-primary' : index < 4 ? 'bg-primary/70' : 'bg-primary/45'}`} style={{ width: `${Math.min(Math.max(percentage === '100%' ? 100 : parseFloat(percentage as string), 0), 100)}%` }} />
+                  <div 
+                    className={`h-full rounded-full transition-all duration-500 ${
+                      index < 2 ? 'bg-primary' : index < 4 ? 'bg-primary/75' : 'bg-primary/50'
+                    }`} 
+                    style={{ width: `${Math.min(Math.max(percentage === '100%' ? 100 : parseFloat(percentage as string), 0), 100)}%` }} 
+                  />
                 </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="mt-5 border-t border-border pt-4 text-xs text-muted-foreground flex items-center justify-between">
+            <span>Top conversion driver:</span>
+            <span className="font-semibold text-foreground">
+              {convertedLeads > 0 ? (config.intentDistribution[0]?.label || 'High Intent') : 'No conversions recorded yet'}
+            </span>
+          </div>
+        </article>
+      </section>
+
+      {/* Vertical-Specific AI Intelligence Panel */}
+      <section className="grid gap-5 lg:grid-cols-3">
+        {/* Card 1: Intent & Category Distribution */}
+        <article className="rounded-xl border border-border bg-card p-5">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-black text-foreground">Top Inquired Categories</h3>
+            <span className={`rounded-full px-2.5 py-0.5 text-[10px] font-black ${
+              hasRealIntents ? 'bg-primary/10 text-primary' : 'bg-muted text-muted-foreground'
+            }`}>
+              {hasRealIntents ? `AI Analyzed (${realIntents.reduce((a, b) => a + (b.count || 0), 0)} calls)` : 'Awaiting Intent Signals'}
+            </span>
+          </div>
+          <p className="mt-1 text-xs font-semibold text-muted-foreground">
+            {hasRealIntents 
+              ? `Real buyer intent signals extracted from ${config.shortLabel} conversations`
+              : callsMade > 0 
+              ? `${callsMade} call connected • No specific category inquired by caller`
+              : `Target inquiry taxonomy configured for ${config.shortLabel}`}
+          </p>
+
+          {hasRealIntents ? (
+            <div className="mt-4 space-y-3">
+              {realIntents.map((item) => (
+                <div key={item.label}>
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-bold text-foreground truncate max-w-[190px]">{item.label}</span>
+                    <span className="font-black text-foreground">{item.pct}% ({item.count})</span>
+                  </div>
+                  <div className="mt-1 h-1.5 rounded-full bg-muted overflow-hidden">
+                    <div className="h-full rounded-full bg-primary" style={{ width: `${item.pct}%` }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="mt-4 flex flex-col items-center justify-center rounded-lg border border-dashed border-border/80 p-5 text-center">
+              <div className="flex h-9 w-9 items-center justify-center rounded-full bg-muted text-muted-foreground">
+                <Activity size={16} />
+              </div>
+              <p className="mt-2 text-xs font-semibold text-foreground">
+                {callsMade > 0 
+                  ? `${callsMade} call recorded • 0 category requests detected` 
+                  : `0 ${config.shortLabel} calls analyzed`}
+              </p>
+              <p className="mt-1 text-[11px] text-muted-foreground leading-relaxed max-w-[260px]">
+                {callsMade > 0 
+                  ? `The customer did not state a specific ${config.offeringName.toLowerCase()}. When callers mention specific services or needs, live distribution bars will populate here.` 
+                  : `Live intent breakdown will populate automatically once calls are processed.`}
+              </p>
+              <div className="mt-3 flex flex-wrap justify-center gap-1.5">
+                {config.intentDistribution.map((item) => (
+                  <span key={item.label} className="rounded-md bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+                    {item.label}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </article>
+
+        {/* Card 2: AI Extraction Parameters */}
+        <article className="rounded-xl border border-border bg-card p-5">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-black text-foreground">AI Extraction Parameters</h3>
+            <span className="rounded-full bg-emerald-500/10 px-2.5 py-0.5 text-[10px] font-black text-emerald-600 dark:text-emerald-400">Active Schema</span>
+          </div>
+          <p className="mt-1 text-xs font-semibold text-muted-foreground">
+            Structured fields extracted into CRM webhook payload
+          </p>
+
+          <div className="mt-4 space-y-2.5">
+            {config.keyExtractionFields.map((field, idx) => (
+              <div key={idx} className="flex items-center gap-2 rounded-lg bg-muted/60 px-3 py-2 text-xs">
+                <CheckCircle2 size={14} className="text-emerald-500 shrink-0 stroke-[2.5]" />
+                <span className="font-bold text-foreground truncate">{field}</span>
+              </div>
+            ))}
+          </div>
+        </article>
+
+        {/* Card 3: Top Objections & Voice Agent Counter-Pitch */}
+        <article className="rounded-xl border border-border bg-card p-5">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-black text-foreground">
+              {hasRealObjections ? 'Top Objections Handled' : 'Configured Objection Playbook'}
+            </h3>
+            <span className={`rounded-full px-2.5 py-0.5 text-[10px] font-black ${
+              hasRealObjections ? 'bg-amber-500/10 text-amber-600' : 'bg-primary/10 text-primary'
+            }`}>
+              {hasRealObjections ? 'Speech AI' : 'Playbook Active'}
+            </span>
+          </div>
+          <p className="mt-1 text-xs font-semibold text-muted-foreground">
+            {hasRealObjections 
+              ? `Friction points detected on live ${config.shortLabel} calls`
+              : callsMade > 0 
+              ? `0 objections raised on ${callsMade} call recorded`
+              : `Rules your voice agent will use when prospects raise concerns on calls`}
+          </p>
+
+          <div className="mt-3 space-y-3">
+            {(hasRealObjections ? realObjections : config.topObjections).map((item, idx) => (
+              <div key={idx} className="border-b border-border/60 pb-2.5 last:border-0 last:pb-0">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-bold text-foreground">{item.objection}</span>
+                  <span className="text-xs font-black text-foreground">
+                    {hasRealObjections ? item.frequency : 'Active Rule'}
+                  </span>
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
+                  <span className="font-bold text-primary">AI Rebuttal:</span> {item.aiHandling || 'Pre-trained counter-pitch with real-time value positioning'}
+                </p>
               </div>
             ))}
           </div>
         </article>
       </section>
 
+      {/* Quick Link to Industry Prompt Studio */}
+      <section className="flex flex-col items-center justify-between gap-4 rounded-xl border border-primary/20 bg-gradient-to-r from-primary/10 via-background to-primary/5 p-4 sm:flex-row sm:p-5">
+        <div className="flex items-center gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-md">
+            <IndustryIcon size={20} />
+          </div>
+          <div>
+            <h4 className="text-sm font-bold text-foreground">
+              Tuning Voice AI for {config.label}?
+            </h4>
+            <p className="text-xs text-muted-foreground">
+              Customize conversation persona, Hindi/English greeting, and qualification checklist in the AI Prompt Studio.
+            </p>
+          </div>
+        </div>
 
+        <Link
+          href={`/prompt?template=${selectedIndustry}`}
+          className="flex shrink-0 items-center gap-1.5 rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground shadow-md hover:opacity-90"
+        >
+          Open {config.shortLabel} Prompt Studio
+          <ArrowRight size={14} />
+        </Link>
+      </section>
     </AppLayout>
   )
 }

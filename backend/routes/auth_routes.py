@@ -10,13 +10,19 @@ from auth import (
     get_current_user,
     normalize_role,
     ROLE_SUPER_ADMIN,
+    require_company_access,
 )
+from services.billing_service import billing_service
+from industry_templates import INDUSTRY_TEMPLATES
 
 auth_router = APIRouter()
 
 
 def _self_register_enabled() -> bool:
-    return str(os.environ.get("ALLOW_SELF_REGISTER", "")).strip().lower() in ("1", "true", "yes", "on")
+    val = os.environ.get("ALLOW_SELF_REGISTER")
+    if val is None:
+        return True # Default to self-serve enabled for rapid onboarding
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
 
 
 @auth_router.post("/register")
@@ -62,16 +68,51 @@ async def register_company(payload: dict = Body(...)):
     company_id = str(uuid.uuid4())
     user_id = str(uuid.uuid4())
     now = datetime.utcnow()
+    industry = payload.get("industry") or "general_sales"
+    tmpl = INDUSTRY_TEMPLATES.get(industry, INDUSTRY_TEMPLATES.get("general_sales"))
 
     await db.companies.insert_one({
-        "company_id": company_id, "name": company_name, "plan_type": "trial",
-        "status": "ACTIVE", "bolna_agent_id": None, "created_at": now, "updated_at": now,
+        "company_id": company_id,
+        "name": company_name,
+        "industry": industry,
+        "plan_type": "trial",
+        "status": "ACTIVE",
+        "bolna_agent_id": None,
+        "webhook_url": payload.get("webhook_url", ""),
+        "created_at": now,
+        "updated_at": now,
     })
     await db.users.insert_one({
-        "user_id": user_id, "company_id": company_id, "name": user_name, "email": email,
-        "password_hash": get_password_hash(password), "role": "company_admin",
-        "is_active": True, "created_at": now, "updated_at": now,
+        "user_id": user_id,
+        "company_id": company_id,
+        "name": user_name,
+        "email": email,
+        "password_hash": get_password_hash(password),
+        "role": "company_admin",
+        "is_active": True,
+        "created_at": now,
+        "updated_at": now,
     })
+
+    # Initialize default prompt from industry template
+    if tmpl:
+        await db.prompts.insert_one({
+            "company_id": company_id,
+            "draft_prompt": tmpl["prompt"],
+            "published_prompt": tmpl["prompt"],
+            "draft_welcome_message": tmpl["welcome_message"],
+            "published_welcome_message": tmpl["welcome_message"],
+            "status": "Published",
+            "updated_at": now
+        })
+
+    # Automatically grant ₹100 Free Trial starter wallet credits (~10 free call minutes)
+    try:
+        await billing_service.add_credits(
+            db, company_id, 100.0, "TRIAL_GRANT", f"trial_{company_id}", "Free Trial Starter Credits (10 Free Minutes)"
+        )
+    except Exception as ex:
+        print(f"Warning: Failed to grant trial credits: {ex}")
 
     access_token = create_access_token(data={"sub": user_id, "email": email})
     return {
@@ -79,8 +120,13 @@ async def register_company(payload: dict = Body(...)):
         "access_token": access_token,
         "token_type": "bearer",
         "user": {
-            "id": user_id, "name": user_name, "email": email,
-            "role": "company_admin", "company_id": company_id, "company_name": company_name,
+            "id": user_id,
+            "name": user_name,
+            "email": email,
+            "role": "company_admin",
+            "company_id": company_id,
+            "company_name": company_name,
+            "industry": industry
         },
     }
 
@@ -106,10 +152,12 @@ async def login(payload: dict = Body(...)):
     company_id = None if role == ROLE_SUPER_ADMIN else user.get("company_id")
 
     company_name = "Platform" if role == ROLE_SUPER_ADMIN else "Unknown"
+    industry = None
     if company_id:
         company = await db.companies.find_one({"company_id": company_id})
         if company:
             company_name = company.get("name", "Unknown")
+            industry = company.get("industry") or "healthcare"
 
     # The token only needs to identify the user; role/company are re-resolved from
     # the DB on every request by auth.get_current_user.
@@ -125,6 +173,7 @@ async def login(payload: dict = Body(...)):
             "role": role,
             "company_id": company_id,
             "company_name": company_name,
+            "industry": industry,
         },
     }
 
@@ -166,10 +215,12 @@ async def activate_account(payload: dict = Body(...)):
 async def get_me(current_user: dict = Depends(get_current_user)):
     db = mongodb.get_db()
     company_name = "Platform" if current_user["role"] == ROLE_SUPER_ADMIN else None
+    industry = None
     if current_user.get("company_id"):
         company = await db.companies.find_one({"company_id": current_user["company_id"]})
         if company:
             company_name = company.get("name")
+            industry = company.get("industry") or "healthcare"
     return {
         "id": current_user["user_id"],
         "user_id": current_user["user_id"],
@@ -178,5 +229,42 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         "role": current_user["role"],
         "company_id": current_user.get("company_id"),
         "company_name": company_name,
+        "industry": industry,
         "is_active": current_user.get("is_active", True),
     }
+
+@auth_router.get("/company-settings")
+async def get_company_settings(current_user: dict = Depends(require_company_access)):
+    db = mongodb.get_db()
+    company = await db.companies.find_one({"company_id": current_user["company_id"]})
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    return {
+        "status": "success",
+        "company": {
+            "company_id": company.get("company_id"),
+            "name": company.get("name"),
+            "industry": company.get("industry") or "healthcare",
+            "webhook_url": company.get("webhook_url", ""),
+            "plan_type": company.get("plan_type", "trial")
+        }
+    }
+
+@auth_router.patch("/company-settings")
+async def update_company_settings(payload: dict = Body(...), current_user: dict = Depends(require_company_access)):
+    db = mongodb.get_db()
+    update_fields = {}
+    if "name" in payload:
+        update_fields["name"] = payload["name"]
+    if "industry" in payload:
+        update_fields["industry"] = payload["industry"]
+    if "webhook_url" in payload:
+        update_fields["webhook_url"] = payload["webhook_url"]
+    
+    if update_fields:
+        update_fields["updated_at"] = datetime.utcnow()
+        await db.companies.update_one(
+            {"company_id": current_user["company_id"]},
+            {"$set": update_fields}
+        )
+    return {"status": "success", "message": "Company settings updated successfully."}

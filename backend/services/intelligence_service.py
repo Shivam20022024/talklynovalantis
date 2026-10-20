@@ -7,9 +7,9 @@ class IntelligenceService:
     Service for calculating AI Business Intelligence metrics across calls.
     """
     
-    async def get_dashboard_metrics(self, db, company_id: str, range_str: str = "30 Days", campaign_id: str = None) -> Dict[str, Any]:
+    async def get_dashboard_metrics(self, db, company_id: str, range_str: str = "30 Days", campaign_id: str = None, industry: str = None) -> Dict[str, Any]:
         """
-        Calculates top-level metrics for the BI Dashboard.
+        Calculates top-level metrics for the BI Dashboard, optionally filtered by campaign or industry vertical.
         """
         today = datetime.utcnow()
         if range_str == "Today":
@@ -26,9 +26,26 @@ class IntelligenceService:
         base_query_leads = {"company_id": company_id, "created_at": {"$gte": start_date}}
         base_query_calls = {"company_id": company_id, "created_at": {"$gte": start_date}}
         
+        call_industry_conds = []
         if campaign_id:
             base_query_leads["campaign_id"] = campaign_id
             base_query_calls["campaign_id"] = campaign_id
+        elif industry and industry != "all":
+            # Match campaigns that belong to this industry vertical
+            matching_campaigns = await db.campaigns.find(
+                {"company_id": company_id, "industry": industry}, 
+                {"campaign_id": 1}
+            ).to_list(length=500)
+            matching_campaign_ids = [c["campaign_id"] for c in matching_campaigns if c.get("campaign_id")]
+            
+            call_industry_conds = [{"industry": industry}]
+            lead_industry_conds = [{"industry": industry}]
+            if matching_campaign_ids:
+                call_industry_conds.append({"campaign_id": {"$in": matching_campaign_ids}})
+                lead_industry_conds.append({"campaign_id": {"$in": matching_campaign_ids}})
+            
+            base_query_calls["$or"] = call_industry_conds
+            base_query_leads["$or"] = lead_industry_conds
         
         # 1-4. Concurrently fetch all top-level metrics
         total_leads_task = db.leads.count_documents(base_query_leads)
@@ -37,17 +54,30 @@ class IntelligenceService:
             **base_query_calls,
             "status": {"$in": ["Completed", "completed", "Analyzed"]}
         })
-        qualified_leads_task = db.leads.count_documents({**base_query_leads, "status": "Qualified"})
-        interested_leads_task = db.leads.count_documents({**base_query_leads, "status": "Interested"})
+        qualified_leads_task = db.leads.count_documents({
+            **base_query_leads, 
+            "status": {"$in": ["Qualified", "Converted"]}
+        })
+        interested_leads_task = db.leads.count_documents({
+            **base_query_leads, 
+            "status": {"$in": ["Interested", "Qualified", "Converted"]}
+        })
         converted_leads_task = db.leads.count_documents({**base_query_leads, "status": "Converted"})
         contacted_leads_task = db.leads.count_documents({**base_query_leads, "status": {"$ne": "New"}})
         
+        analyzed_calls_task = db.calls.count_documents({
+            **base_query_calls,
+            "analysis": {"$exists": True}
+        })
+        
         (
             total_leads, calls_made, connected_calls, 
-            qualified_leads, interested_leads, converted_leads, contacted_leads
+            qualified_leads, interested_leads, converted_leads, contacted_leads,
+            analyzed_calls_count
         ) = await asyncio.gather(
             total_leads_task, calls_made_task, connected_calls_task,
-            qualified_leads_task, interested_leads_task, converted_leads_task, contacted_leads_task
+            qualified_leads_task, interested_leads_task, converted_leads_task, contacted_leads_task,
+            analyzed_calls_task
         )
         
         # 5. Conversion Rate
@@ -72,6 +102,8 @@ class IntelligenceService:
                 chart_base = {"company_id": company_id, "created_at": {"$gte": d_start, "$lt": d_end}}
                 if campaign_id:
                     chart_base["campaign_id"] = campaign_id
+                elif call_industry_conds:
+                    chart_base["$or"] = call_industry_conds
                     
                 chart_tasks.append(db.calls.count_documents(chart_base))
                 chart_tasks.append(db.calls.count_documents({**chart_base, "status": {"$in": ["Completed", "completed", "Analyzed"]}}))
@@ -86,6 +118,8 @@ class IntelligenceService:
                 chart_base = {"company_id": company_id, "created_at": {"$gte": d_start, "$lt": d_end}}
                 if campaign_id:
                     chart_base["campaign_id"] = campaign_id
+                elif call_industry_conds:
+                    chart_base["$or"] = call_industry_conds
                     
                 chart_tasks.append(db.calls.count_documents(chart_base))
                 chart_tasks.append(db.calls.count_documents({**chart_base, "status": {"$in": ["Completed", "completed", "Analyzed"]}}))
@@ -99,6 +133,54 @@ class IntelligenceService:
                     "calls_made": results[idx*2],
                     "connected_calls": results[idx*2 + 1]
                 })
+
+        # Aggregate real intents and objections from analyzed calls
+        analyzed_calls_cursor = db.calls.find(
+            {**base_query_calls, "analysis": {"$exists": True}},
+            {"analysis": 1}
+        ).limit(200)
+
+        intent_counts = {}
+        objection_counts = {}
+        total_intents_found = 0
+        total_objections_found = 0
+
+        async for call_doc in analyzed_calls_cursor:
+            analysis = call_doc.get("analysis", {})
+            intents_list = list(analysis.get("intents", []) or [])
+            req_offering = (analysis.get("requirements") or {}).get("offering")
+            if req_offering and req_offering not in intents_list:
+                intents_list.append(req_offering)
+            
+            for itm in intents_list:
+                if itm and isinstance(itm, str) and itm.strip():
+                    key = itm.strip()
+                    intent_counts[key] = intent_counts.get(key, 0) + 1
+                    total_intents_found += 1
+            
+            objs_list = analysis.get("key_objections", []) or []
+            for obj in objs_list:
+                obj_text = ""
+                if isinstance(obj, dict):
+                    obj_text = obj.get("content") or obj.get("type") or ""
+                elif isinstance(obj, str):
+                    obj_text = obj
+                if obj_text and obj_text.strip():
+                    key = obj_text.strip()
+                    objection_counts[key] = objection_counts.get(key, 0) + 1
+                    total_objections_found += 1
+
+        real_intents = []
+        if total_intents_found > 0:
+            for label, cnt in sorted(intent_counts.items(), key=lambda x: x[1], reverse=True)[:5]:
+                pct = round((cnt / total_intents_found) * 100)
+                real_intents.append({"label": label, "count": cnt, "pct": pct})
+
+        real_objections = []
+        if total_objections_found > 0:
+            for label, cnt in sorted(objection_counts.items(), key=lambda x: x[1], reverse=True)[:4]:
+                pct = round((cnt / total_objections_found) * 100)
+                real_objections.append({"objection": label, "count": cnt, "frequency": f"{pct}%"})
             
         return {
             "total_leads": total_leads,
@@ -109,7 +191,10 @@ class IntelligenceService:
             "converted_leads": converted_leads,
             "contacted_leads": contacted_leads,
             "conversion_rate": conversion_rate,
-            "chart_data": chart_data
+            "chart_data": chart_data,
+            "analyzed_calls_count": analyzed_calls_count,
+            "real_intents": real_intents,
+            "real_objections": real_objections
         }
     async def get_overall_dashboard_metrics(self, db, company_id: str) -> Dict[str, Any]:
         """

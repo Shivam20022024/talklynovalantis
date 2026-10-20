@@ -1,4 +1,4 @@
-﻿__pycache__/
+__pycache__/
 *.py[cod]
 *.class
 *.so
@@ -8,8 +8,12 @@ build/
 dist/
 .env
 .env.local
+*.env*
 .venv
 venv/
 node_modules/
 .next/
 backend/check_*.py
+backend/*.log
+backend/payload_dump.json
+*.tsbuildinfo

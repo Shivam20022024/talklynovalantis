@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { MessageSquare, BarChart3, ShieldCheck, Zap, Smile, Meh, Frown } from 'lucide-react';
-import Button from '../ui/Button';
+import Button from '../ui/button';
 
 const DemoSection: React.FC = () => {
   const [activeMessage, setActiveMessage] = useState(0);

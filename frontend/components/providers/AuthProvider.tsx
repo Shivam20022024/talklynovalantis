@@ -19,6 +19,7 @@ interface User {
   role: Role;
   company_id: string | null;
   company_name: string;
+  industry?: string;
 }
 
 export interface CompanyContext {
@@ -34,6 +35,7 @@ interface AuthContextType {
   setCompanyContext: (ctx: CompanyContext | null) => void;
   login: (token: string, user: User) => void;
   logout: () => void;
+  refreshUser: () => Promise<void>;
 }
 
 const CTX_KEY = 'sa_company_context';
@@ -46,12 +48,25 @@ const AuthContext = createContext<AuthContextType>({
   setCompanyContext: () => {},
   login: () => {},
   logout: () => {},
+  refreshUser: async () => {},
 });
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [companyContext, setCompanyContextState] = useState<CompanyContext | null>(null);
+
+  const refreshUser = useCallback(async () => {
+    const token = getAuthToken();
+    if (token) {
+      try {
+        const userData = await fetchApi('/api/v1/auth/me');
+        setUser({ ...userData, role: normalizeRole(userData.role) });
+      } catch (error) {
+        console.error('Auth verification failed', error);
+      }
+    }
+  }, []);
 
   useEffect(() => {
     try {
@@ -107,7 +122,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, loading, isSuperAdmin, companyContext, setCompanyContext, login, logout }}
+      value={{ user, loading, isSuperAdmin, companyContext, setCompanyContext, login, logout, refreshUser }}
     >
       {children}
     </AuthContext.Provider>
