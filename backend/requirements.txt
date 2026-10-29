@@ -10,6 +10,7 @@ requests
 pydub
 razorpay
 livekit-api
+websockets
 
 PyJWT
 passlib[bcrypt]
