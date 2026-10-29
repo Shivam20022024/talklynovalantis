@@ -9,6 +9,7 @@ python-dotenv==1.0.1
 requests
 pydub
 razorpay
+livekit
 
 PyJWT
 passlib[bcrypt]
