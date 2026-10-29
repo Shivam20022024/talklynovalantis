@@ -97,14 +97,27 @@ export default function LoginPage() {
           <a href="/register" className="font-semibold text-primary hover:underline">
             Start Free Trial
           </a>
-          <span className="mx-1 text-muted-foreground/60">•</span>
-          <a href="/request-access" className="text-xs text-muted-foreground hover:underline">
+        </p>
+        <p className="mt-2 text-center text-xs text-muted-foreground">
+          <a href="/request-access" className="hover:underline">
             Request Demo
           </a>
         </p>
+
+        <div className="mt-6 border-t border-border pt-4 flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground">
+          <a href="/pricing" className="hover:text-foreground hover:underline">Pricing</a>
+          <span className="text-border">·</span>
+          <a href="/terms" className="hover:text-foreground hover:underline">Terms</a>
+          <span className="text-border">·</span>
+          <a href="/privacy" className="hover:text-foreground hover:underline">Privacy</a>
+          <span className="text-border">·</span>
+          <a href="/refund-policy" className="hover:text-foreground hover:underline">Refund Policy</a>
+          <span className="text-border">·</span>
+          <a href="/contact" className="hover:text-foreground hover:underline">Contact</a>
+        </div>
       </div>
       <div className="mt-8 text-center text-sm text-muted-foreground font-medium">
-        Made by Novalantis
+        A product by <span className="font-semibold text-foreground">Novalantis</span>
       </div>
     </div>
   );

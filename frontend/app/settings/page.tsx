@@ -27,6 +27,7 @@ type TelephonyProviderKey = 'twilio' | 'exotel' | 'plivo' | 'bolna'
 
 interface ProviderMeta {
   id: TelephonyProviderKey
+  unsupported?: boolean
   name: string
   tagline: string
   color: string
@@ -34,8 +35,8 @@ interface ProviderMeta {
 }
 
 const PROVIDERS: ProviderMeta[] = [
-  { id: 'twilio', name: 'Twilio', tagline: 'Global SMS & Voice Carrier', color: 'border-red-500/40 bg-red-500/5 text-red-600 dark:text-red-400', badgeColor: 'bg-red-500/10 text-red-600 dark:text-red-400' },
-  { id: 'exotel', name: 'Exotel', tagline: "India's #1 Virtual Telecom Carrier", color: 'border-blue-500/40 bg-blue-500/5 text-blue-600 dark:text-blue-400', badgeColor: 'bg-blue-500/10 text-blue-600 dark:text-blue-400' },
+  { id: 'twilio', name: 'Twilio', tagline: 'Global SMS & Voice Carrier', color: 'border-red-500/40 bg-red-500/5 text-red-600 dark:text-red-400', badgeColor: 'bg-red-500/10 text-red-600 dark:text-red-400', unsupported: true },
+  { id: 'exotel', name: 'Exotel', tagline: "India's #1 Virtual Telecom Carrier", color: 'border-blue-500/40 bg-blue-500/5 text-blue-600 dark:text-blue-400', badgeColor: 'bg-blue-500/10 text-blue-600 dark:text-blue-400', unsupported: true },
   { id: 'plivo', name: 'Plivo', tagline: 'High-Volume Voice & SIP Trunking', color: 'border-emerald-500/40 bg-emerald-500/5 text-emerald-600 dark:text-emerald-400', badgeColor: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' },
   { id: 'bolna', name: 'Bolna Direct', tagline: 'Native Ultra-Low Latency SIP', color: 'border-purple-500/40 bg-purple-500/5 text-purple-600 dark:text-purple-400', badgeColor: 'bg-purple-500/10 text-purple-600 dark:text-purple-400' }
 ]
@@ -56,8 +57,8 @@ export default function SettingsPage() {
 
   // Telephony State (Haira-inspired Call Settings)
   const [telephonyMode, setTelephonyMode] = useState<'shared' | 'custom'>('shared')
-  const [sharedNumber, setSharedNumber] = useState('+918031830100')
-  const [sharedLabel, setSharedLabel] = useState('+91 80 3183 0100 (Talkly shared number)')
+  const [sharedNumber, setSharedNumber] = useState('+918065535758')
+  const [sharedLabel, setSharedLabel] = useState('+91 80 6553 5758 (Talkly Plivo shared number)')
   const [connectedLine, setConnectedLine] = useState<any>(null)
   const [selectedProvider, setSelectedProvider] = useState<TelephonyProviderKey>('twilio')
   const [inboundRouting, setInboundRouting] = useState({ mode: 'ai_agent', fallback_number: '' })
@@ -73,6 +74,14 @@ export default function SettingsPage() {
   const [whatsappSaveSuccess, setWhatsappSaveSuccess] = useState(false)
   const [whatsappTestResult, setWhatsappTestResult] = useState<{ success: boolean; message: string } | null>(null)
 
+  // LiveKit Cloud Settings
+  const [livekitUrl, setLivekitUrl] = useState('')
+  const [livekitApiKey, setLivekitApiKey] = useState('')
+  const [livekitApiSecret, setLivekitApiSecret] = useState('')
+  const [livekitHasSecret, setLivekitHasSecret] = useState(false)
+  const [savingLivekit, setSavingLivekit] = useState(false)
+  const [livekitSaveSuccess, setLivekitSaveSuccess] = useState(false)
+
   // Connect Line Modal State
   const [showConnectModal, setShowConnectModal] = useState(false)
   const [connectingLine, setConnectingLine] = useState(false)
@@ -87,10 +96,11 @@ export default function SettingsPage() {
   useEffect(() => {
     const loadSettings = async () => {
       try {
-        const [compRes, telRes, waRes] = await Promise.all([
+        const [compRes, telRes, waRes, lkRes] = await Promise.all([
           fetchApi('/api/v1/auth/company-settings'),
           fetchApi('/api/v1/telephony/settings').catch(() => null),
-          fetchApi('/api/v1/whatsapp/settings').catch(() => null)
+          fetchApi('/api/v1/whatsapp/settings').catch(() => null),
+          fetchApi('/api/v1/livekit/settings').catch(() => null)
         ])
 
         if (compRes?.company) {
@@ -106,6 +116,15 @@ export default function SettingsPage() {
           setWhatsappHasToken(Boolean(waRes.config.has_token))
           if (waRes.config.masked_token) {
             setWhatsappAccessToken(waRes.config.masked_token)
+          }
+        }
+
+        if (lkRes?.config) {
+          setLivekitUrl(lkRes.config.url || '')
+          setLivekitApiKey(lkRes.config.api_key || '')
+          setLivekitHasSecret(Boolean(lkRes.config.has_secret))
+          if (lkRes.config.masked_secret) {
+            setLivekitApiSecret(lkRes.config.masked_secret)
           }
         }
 
@@ -209,6 +228,29 @@ export default function SettingsPage() {
       setWhatsappTestResult({ success: false, message: e.message || 'Failed to send WhatsApp message' })
     } finally {
       setTestingWhatsapp(false)
+    }
+  }
+
+  const handleSaveLivekit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setSavingLivekit(true)
+    setLivekitSaveSuccess(false)
+    try {
+      await fetchApi('/api/v1/livekit/settings', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          url: livekitUrl,
+          api_key: livekitApiKey,
+          api_secret: livekitApiSecret.startsWith('••••') ? undefined : livekitApiSecret
+        })
+      })
+      setLivekitSaveSuccess(true)
+      setLivekitHasSecret(Boolean(livekitApiSecret))
+      setTimeout(() => setLivekitSaveSuccess(false), 3000)
+    } catch (e: any) {
+      alert(e.message || 'Failed to save LiveKit settings')
+    } finally {
+      setSavingLivekit(false)
     }
   }
 
@@ -467,7 +509,11 @@ export default function SettingsPage() {
                     >
                       <div className="flex w-full items-center justify-between">
                         <span className="font-bold text-sm text-foreground">{p.name}</span>
-                        {hasLine ? (
+                        {p.unsupported ? (
+                          <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-bold text-amber-600 dark:text-amber-400">
+                            Coming soon
+                          </span>
+                        ) : hasLine ? (
                           <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-bold text-emerald-600 dark:text-emerald-400">
                             1 line
                           </span>
@@ -476,6 +522,9 @@ export default function SettingsPage() {
                         )}
                       </div>
                       <p className="text-[11px] text-muted-foreground line-clamp-1">{p.tagline}</p>
+                      {p.unsupported && (
+                        <p className="text-[10px] text-amber-600 dark:text-amber-400">Can't place live calls yet - Plivo only</p>
+                      )}
                     </button>
                   )
                 })}
@@ -494,7 +543,7 @@ export default function SettingsPage() {
                   </p>
                 </div>
 
-                {!isCurrentProviderConnected && (
+                {!isCurrentProviderConnected && !PROVIDERS.find(p => p.id === selectedProvider)?.unsupported && (
                   <button
                     type="button"
                     onClick={() => handleOpenConnectModal(selectedProvider)}
@@ -711,6 +760,82 @@ export default function SettingsPage() {
                 </div>
               )}
             </div>
+          </div>
+
+          {/* LiveKit Cloud Real-Time Voice Engine */}
+          <div className="rounded-xl border border-border bg-card p-6 shadow-sm">
+            <div className="flex items-center justify-between mb-2">
+              <h2 className="text-base font-bold flex items-center gap-2 text-foreground">
+                <Radio size={18} className="text-primary" /> LiveKit Cloud (Real-Time Voice Engine)
+              </h2>
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/10 px-2.5 py-0.5 text-[11px] font-bold text-primary border border-primary/20">
+                <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
+                10,000 Free Mins/mo Included
+              </span>
+            </div>
+            <p className="text-xs text-muted-foreground mb-4">
+              Powers ultra-low-latency (&lt;300ms) WebRTC voice calls and in-browser testing with sub-50ms instant interruption (barge-in).
+            </p>
+
+            {livekitSaveSuccess && (
+              <div className="mb-4 flex items-center gap-2 rounded-lg bg-emerald-500/10 border border-emerald-500/20 p-3 text-xs font-semibold text-emerald-600 dark:text-emerald-400">
+                <CheckCircle2 size={15} /> LiveKit configuration saved successfully!
+              </div>
+            )}
+
+            <form onSubmit={handleSaveLivekit} className="space-y-4">
+              <div>
+                <label className="text-xs font-bold text-foreground">LiveKit WebSocket Server URL</label>
+                <input
+                  type="text"
+                  value={livekitUrl}
+                  onChange={(e) => setLivekitUrl(e.target.value)}
+                  placeholder="wss://your-project.livekit.cloud"
+                  className="mt-1.5 w-full rounded-lg border border-border bg-background px-3.5 py-2.5 text-sm font-mono text-foreground outline-none focus:border-primary focus:ring-1 focus:ring-primary shadow-xs"
+                />
+                <p className="mt-1 text-xs text-muted-foreground">Found in LiveKit Cloud project settings at cloud.livekit.io</p>
+              </div>
+
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div>
+                  <label className="text-xs font-bold text-foreground">LiveKit API Key</label>
+                  <input
+                    type="text"
+                    value={livekitApiKey}
+                    onChange={(e) => setLivekitApiKey(e.target.value)}
+                    placeholder="APIxxxxxxxxxxxx"
+                    className="mt-1.5 w-full rounded-lg border border-border bg-background px-3.5 py-2.5 text-sm font-mono text-foreground outline-none focus:border-primary focus:ring-1 focus:ring-primary shadow-xs"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-xs font-bold text-foreground">LiveKit API Secret</label>
+                  <input
+                    type="password"
+                    value={livekitApiSecret}
+                    onChange={(e) => setLivekitApiSecret(e.target.value)}
+                    placeholder="••••••••••••••••"
+                    className="mt-1.5 w-full rounded-lg border border-border bg-background px-3.5 py-2.5 text-sm font-mono text-foreground outline-none focus:border-primary focus:ring-1 focus:ring-primary shadow-xs"
+                  />
+                  <p className="mt-1 text-xs text-muted-foreground">{livekitHasSecret ? '✓ Secret configured securely.' : 'Generated in LiveKit Cloud Keys tab.'}</p>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between pt-2">
+                <span className="text-xs text-muted-foreground">
+                  Need a free LiveKit Cloud account? Get 10,000 free mins at <a href="https://cloud.livekit.io" target="_blank" rel="noreferrer" className="text-primary font-semibold underline">cloud.livekit.io</a>.
+                </span>
+                <button
+                  type="submit"
+                  disabled={savingLivekit}
+                  className="flex items-center gap-2 rounded-lg px-4 py-2.5 text-xs font-bold shadow-md hover:opacity-90 disabled:opacity-50 transition-all cursor-pointer"
+                  style={{ backgroundColor: '#18181b', color: '#ffffff' }}
+                >
+                  {savingLivekit ? <Loader2 size={14} className="animate-spin text-white" /> : <Save size={14} className="text-white" />}
+                  <span>{savingLivekit ? 'Saving...' : 'Save LiveKit Settings'}</span>
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

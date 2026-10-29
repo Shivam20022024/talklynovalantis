@@ -4,6 +4,13 @@ import os
 import sys
 import warnings
 
+try:
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 # Suppress pydub RuntimeWarnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="pydub")
 
@@ -50,21 +57,81 @@ from services.whatsapp_service import whatsapp_service
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 
+import shutil
 from contextlib import asynccontextmanager
 
 # Load env values
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env.local"))
 
+ngrok_process = None
+
+def ensure_ngrok_tunnel():
+    """
+    Automatically checks and starts ngrok tunnel if running in local development
+    and BASE_URL is set to an ngrok domain.
+    """
+    global ngrok_process
+    base_url = os.environ.get("BASE_URL", "").strip()
+    if "ngrok" not in base_url.lower():
+        return
+
+    # Check if ngrok is already running on port 4040
+    try:
+        req = requests.get("http://127.0.0.1:4040/api/tunnels", timeout=1.0)
+        if req.status_code == 200:
+            data = req.json()
+            tunnels = [t.get("public_url", "") for t in data.get("tunnels", [])]
+            clean_base = base_url.rstrip("/")
+            if any(clean_base in t for t in tunnels):
+                print(f"[AUTO-NGROK]: Public tunnel active at {base_url} -> port 8002")
+                return
+    except Exception:
+        pass
+
+    # Find ngrok executable
+    ngrok_bin = shutil.which("ngrok")
+    if not ngrok_bin:
+        win_path = os.path.expanduser(r"~\AppData\Local\Microsoft\WindowsApps\ngrok.exe")
+        if os.path.exists(win_path):
+            ngrok_bin = win_path
+
+    if not ngrok_bin:
+        print("[AUTO-NGROK]: ngrok executable not found in PATH. Start manually if testing live phone calls.")
+        return
+
+    domain = base_url.replace("https://", "").replace("http://", "").split("/")[0]
+    cmd = [ngrok_bin, "http", "8002", "--url", domain]
+
+    try:
+        DETACHED_PROCESS = 0x00000008
+        ngrok_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=DETACHED_PROCESS if os.name == 'nt' else 0
+        )
+        print(f"[AUTO-NGROK]: Automatically started ngrok tunnel: {base_url} -> http://localhost:8002")
+    except Exception as e:
+        print(f"[AUTO-NGROK]: Note: Could not auto-launch ngrok ({e}).")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup logic
     await mongodb.ensure_indexes()
+    ensure_ngrok_tunnel()
     print("--- PROVIDER CONFIG ---")
     print(f"OpenRouter Analysis: {os.environ.get('OPENROUTER_MODEL', 'Not Set')} (Key: {bool(os.environ.get('OPENROUTER_API_KEY'))})")
     print(f"OpenAI Analysis: gpt-4o (Key: {bool(os.environ.get('OPENAI_API_KEY'))})")
     yield
-    # Shutdown logic (if any)
+    # Shutdown logic
+    global ngrok_process
+    if ngrok_process:
+        try:
+            ngrok_process.terminate()
+            print("[AUTO-NGROK]: ngrok tunnel stopped.")
+        except Exception:
+            pass
 
 app = FastAPI(lifespan=lifespan)
 
@@ -108,6 +175,10 @@ app.include_router(access_requests_router, prefix="/api/v1/access-requests")
 app.include_router(access_requests_router, prefix="/api/v1/admin/access-requests")
 from routes.whatsapp_routes import whatsapp_router
 app.include_router(whatsapp_router)
+from routes.livekit_routes import livekit_router
+app.include_router(livekit_router)
+from routes.plivo_routes import plivo_router
+app.include_router(plivo_router, prefix="/api/v1/plivo", tags=["Plivo"])
 
 from services.billing_service import billing_service
 @app.get("/")
@@ -156,18 +227,32 @@ def _prompt_view(doc: dict | None) -> dict:
             "welcome_message": DEFAULT_WELCOME,
             "published_prompt": None,
             "published_welcome_message": None,
+            "inbound_prompt": "",
+            "inbound_welcome_message": "",
+            "published_inbound_prompt": None,
+            "published_inbound_welcome_message": None,
             "prompt_status": "Draft",
         }
     draft = doc.get("draft_prompt") or doc.get("prompt")
     draft_welcome = doc.get("draft_welcome_message") or doc.get("welcome_message")
     published = doc.get("published_prompt") or doc.get("prompt")
     published_welcome = doc.get("published_welcome_message") or doc.get("welcome_message")
+
+    draft_inbound = doc.get("draft_inbound_prompt") or doc.get("inbound_prompt")
+    draft_inbound_welcome = doc.get("draft_inbound_welcome_message") or doc.get("inbound_welcome_message")
+    published_inbound = doc.get("published_inbound_prompt")
+    published_inbound_welcome = doc.get("published_inbound_welcome_message")
+
     return {
         "status": "success",
         "prompt": draft or published or DEFAULT_PROMPT,
         "welcome_message": draft_welcome or published_welcome or DEFAULT_WELCOME,
         "published_prompt": published,
         "published_welcome_message": published_welcome,
+        "inbound_prompt": draft_inbound or published_inbound or "",
+        "inbound_welcome_message": draft_inbound_welcome or published_inbound_welcome or "",
+        "published_inbound_prompt": published_inbound,
+        "published_inbound_welcome_message": published_inbound_welcome,
         "prompt_status": doc.get("status", "Published" if published else "Draft"),
         "published_at": doc.get("published_at"),
     }
@@ -185,16 +270,40 @@ async def save_prompt(payload: dict = Body(...), current_user: dict = Depends(re
     db = mongodb.get_db()
     prompt = payload.get("prompt")
     welcome_message = payload.get("welcome_message")
+    inbound_prompt = payload.get("inbound_prompt")
+    inbound_welcome_message = payload.get("inbound_welcome_message")
+    industry = payload.get("industry")
+
+    update_fields = {
+        "draft_prompt": prompt,
+        "draft_welcome_message": welcome_message,
+        "prompt": prompt,
+        "welcome_message": welcome_message,
+        "status": "Draft",
+        "updated_at": datetime.utcnow(),
+    }
+    if inbound_prompt is not None:
+        update_fields["draft_inbound_prompt"] = inbound_prompt
+        update_fields["inbound_prompt"] = inbound_prompt
+    if inbound_welcome_message is not None:
+        update_fields["draft_inbound_welcome_message"] = inbound_welcome_message
+        update_fields["inbound_welcome_message"] = inbound_welcome_message
+    if industry:
+        update_fields["industry"] = industry
+
     await db.prompts.update_one(
         {"company_id": current_user["company_id"]},
-        {"$set": {
-            "draft_prompt": prompt,
-            "draft_welcome_message": welcome_message,
-            "status": "Draft",
-            "updated_at": datetime.utcnow(),
-        }},
+        {"$set": update_fields},
         upsert=True
     )
+    # Deliberately does NOT touch db.companies.industry here. Loading/editing
+    # a template is a preview, not a declaration of the company's business
+    # vertical - that field also drives what industry new Quick Calls get
+    # tagged with and what the Dashboard filters by, so overwriting it on
+    # every draft autosave caused real calls to silently disappear from the
+    # Dashboard whenever someone browsed a different template earlier the
+    # same day. The company's actual industry only changes on /publish
+    # (a deliberate "make this live" action) or via Settings.
     return {"status": "success"}
 
 
@@ -208,21 +317,19 @@ async def publish_prompt(payload: dict | None = Body(None), current_user: dict =
     doc = await db.prompts.find_one({"company_id": company_id})
     prompt = (payload or {}).get("prompt") or (doc or {}).get("draft_prompt") or (doc or {}).get("prompt")
     welcome = (payload or {}).get("welcome_message") or (doc or {}).get("draft_welcome_message") or (doc or {}).get("welcome_message")
+    inbound_prompt = (payload or {}).get("inbound_prompt") or (doc or {}).get("draft_inbound_prompt") or (doc or {}).get("inbound_prompt")
+    inbound_welcome = (payload or {}).get("inbound_welcome_message") or (doc or {}).get("draft_inbound_welcome_message") or (doc or {}).get("inbound_welcome_message")
+    industry = (payload or {}).get("industry") or (doc or {}).get("industry")
     if not prompt:
         raise HTTPException(status_code=400, detail="Nothing to publish - save a draft first")
 
     company = await db.companies.find_one({"company_id": company_id})
     agent_id = (company or {}).get("bolna_agent_id") or os.environ.get("BOLNA_AGENT_ID")
-    if not agent_id:
-        raise HTTPException(
-            status_code=400,
-            detail="This company has no dedicated Bolna agent configured. Ask an administrator to set companies.bolna_agent_id.",
-        )
 
-    # Push the published prompt to THIS company's Bolna agent only.
+    # If Bolna agent is configured, try syncing to Bolna
     api_key = os.environ.get("BOLNA_API_KEY", "").strip()
     bolna_synced = False
-    if api_key:
+    if agent_id and api_key:
         try:
             resp = await run_in_threadpool(
                 requests.patch,
@@ -234,23 +341,42 @@ async def publish_prompt(payload: dict | None = Body(None), current_user: dict =
             )
             bolna_synced = resp.ok
             if not resp.ok:
-                print(f"Bolna agent update failed for company {company_id}: {resp.status_code} {resp.text[:200]}")
+                print(f"Bolna agent update notice for company {company_id}: {resp.status_code}")
         except Exception as e:
-            print(f"Bolna agent update error for company {company_id}: {e}")
+            print(f"Bolna agent update notice for company {company_id}: {e}")
+
+    update_fields = {
+        "published_prompt": prompt,
+        "published_welcome_message": welcome,
+        "draft_prompt": prompt,
+        "draft_welcome_message": welcome,
+        "prompt": prompt,
+        "welcome_message": welcome,
+        "status": "Published",
+        "published_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+    if inbound_prompt:
+        update_fields["published_inbound_prompt"] = inbound_prompt
+        update_fields["draft_inbound_prompt"] = inbound_prompt
+        update_fields["inbound_prompt"] = inbound_prompt
+    if inbound_welcome:
+        update_fields["published_inbound_welcome_message"] = inbound_welcome
+        update_fields["draft_inbound_welcome_message"] = inbound_welcome
+        update_fields["inbound_welcome_message"] = inbound_welcome
+    if industry:
+        update_fields["industry"] = industry
 
     await db.prompts.update_one(
         {"company_id": company_id},
-        {"$set": {
-            "published_prompt": prompt,
-            "published_welcome_message": welcome,
-            "draft_prompt": prompt,
-            "draft_welcome_message": welcome,
-            "status": "Published",
-            "published_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow(),
-        }},
+        {"$set": update_fields},
         upsert=True,
     )
+    if industry:
+        await db.companies.update_one(
+            {"company_id": company_id},
+            {"$set": {"industry": industry, "updated_at": datetime.utcnow()}}
+        )
     return {"status": "success", "bolna_synced": bolna_synced, "agent_id": agent_id}
 
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
@@ -258,14 +384,99 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
 # Startup logic moved to lifespan context manager above
 
 @app.get("/api/v1/calls")
-async def get_calls(limit: int = 20, skip: int = 0, current_user: dict = Depends(require_company_access)):
+async def get_calls(limit: int = 20, skip: int = 0, direction: str = None, current_user: dict = Depends(require_company_access)):
     db = mongodb.get_db()
-    cursor = db.calls.find(tenant_filter(current_user)).sort("created_at", -1).skip(skip).limit(limit)
+    base_filter = {"direction": direction} if direction else None
+    cursor = db.calls.find(tenant_filter(current_user, base_filter)).sort("created_at", -1).skip(skip).limit(limit)
     calls = []
     async for d in cursor:
         d["_id"] = None
         calls.append(d)
     return calls
+
+@app.get("/api/v1/notifications")
+async def get_notifications(limit: int = 20, skip: int = 0, current_user: dict = Depends(require_company_access)):
+    db = mongodb.get_db()
+    cursor = db.notifications.find(tenant_filter(current_user)).sort("created_at", -1).skip(skip).limit(limit)
+    notifications = []
+    async for n in cursor:
+        n["_id"] = None
+        notifications.append(n)
+    unread_count = await db.notifications.count_documents(tenant_filter(current_user, {"read": False}))
+    return {"status": "success", "notifications": notifications, "unread_count": unread_count}
+
+@app.post("/api/v1/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id: str, current_user: dict = Depends(require_company_access)):
+    db = mongodb.get_db()
+    await db.notifications.update_one(
+        tenant_filter(current_user, {"id": notification_id}),
+        {"$set": {"read": True}}
+    )
+    return {"status": "success"}
+
+@app.post("/api/v1/notifications/read-all")
+async def mark_all_notifications_read(current_user: dict = Depends(require_company_access)):
+    db = mongodb.get_db()
+    await db.notifications.update_many(
+        tenant_filter(current_user, {"read": False}),
+        {"$set": {"read": True}}
+    )
+    return {"status": "success"}
+
+@app.get("/api/v1/calls/stats")
+async def get_calls_stats(direction: str = None, current_user: dict = Depends(require_company_access)):
+    db = mongodb.get_db()
+    base_filter = {"direction": direction} if direction else None
+    match = tenant_filter(current_user, base_filter)
+
+    total = await db.calls.count_documents(match)
+    answered = await db.calls.count_documents({**match, "status": {"$in": ["Completed", "Analyzed"]}})
+
+    today_start = datetime(datetime.utcnow().year, datetime.utcnow().month, datetime.utcnow().day)
+    today_count = await db.calls.count_documents({**match, "created_at": {"$gte": today_start}})
+
+    pipeline = [
+        {"$match": match},
+        {"$group": {"_id": None, "total_seconds": {"$sum": "$duration_seconds"}}}
+    ]
+    agg = await db.calls.aggregate(pipeline).to_list(1)
+    total_seconds = float(agg[0]["total_seconds"]) if agg and agg[0].get("total_seconds") else 0.0
+    avg_duration = round(total_seconds / answered, 1) if answered > 0 else 0.0
+
+    unique_callers = len(await db.calls.distinct("customer_id", match))
+
+    return {
+        "status": "success",
+        "total_calls": total,
+        "answered_calls": answered,
+        "missed_calls": max(0, total - answered),
+        "calls_today": today_count,
+        "avg_duration_seconds": avg_duration,
+        "unique_callers": unique_callers
+    }
+
+@app.get("/api/v1/calls/export")
+async def export_calls_excel(direction: str = None, current_user: dict = Depends(require_company_access)):
+    """Properly formatted, single-direction .xlsx export - separate files for
+    inbound vs outbound so the two don't get mixed into one messy sheet."""
+    db = mongodb.get_db()
+    base_filter = {"direction": direction} if direction else None
+    cursor = db.calls.find(tenant_filter(current_user, base_filter)).sort("created_at", -1)
+    calls = await cursor.to_list(length=None)
+
+    from report_service import generate_calls_export
+    direction_label = (direction or "all").title()
+    file_path = await run_in_threadpool(generate_calls_export, calls, direction_label)
+
+    filename = f"talkly_{direction or 'all'}_calls_{datetime.utcnow().strftime('%Y%m%d')}.xlsx"
+
+    from starlette.background import BackgroundTask
+    return FileResponse(
+        file_path,
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        background=BackgroundTask(lambda: os.path.exists(file_path) and os.remove(file_path))
+    )
 
 @app.delete("/api/v1/calls")
 async def delete_all_calls(current_user: dict = Depends(require_company_access)):
@@ -288,6 +499,16 @@ async def get_call(call_id: str, current_user: dict = Depends(require_company_ac
     db = mongodb.get_db()
     doc = await db.calls.find_one(tenant_filter(current_user, {"call_id": call_id}))
     if not doc:
+        # Check if call_id is actually a lead_id or if lead has a phone number
+        lead = await db.leads.find_one(tenant_filter(current_user, {"lead_id": call_id}))
+        if lead and lead.get("phone"):
+            clean_digits = "".join(filter(str.isdigit, str(lead["phone"])))
+            if clean_digits:
+                doc = await db.calls.find_one(
+                    tenant_filter(current_user, {"customer_id": {"$regex": clean_digits}}),
+                    sort=[("created_at", -1)]
+                )
+    if not doc:
         raise HTTPException(status_code=404, detail="Call not found")
     doc["_id"] = None
     return doc
@@ -295,12 +516,15 @@ async def get_call(call_id: str, current_user: dict = Depends(require_company_ac
 @app.post("/api/v1/calls/trigger")
 async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Depends(require_company_access)):
     enforce_no_foreign_company(current_user, payload)
-    phone_number = str(payload.get("phone_number", "")).replace(" ", "").replace("-", "").replace("(", "").replace(")", "").strip()
-    if phone_number and not phone_number.startswith("+"):
-        if len(phone_number) == 10 and phone_number.isdigit():
-            phone_number = f"+91{phone_number}"
-        else:
-            phone_number = f"+{phone_number}"
+    raw_digits = "".join(filter(str.isdigit, str(payload.get("phone_number", ""))))
+    if len(raw_digits) == 10:
+        phone_number = f"+91{raw_digits}"
+    elif len(raw_digits) == 11 and raw_digits.startswith("0"):
+        phone_number = f"+91{raw_digits[1:]}"
+    elif len(raw_digits) == 12 and raw_digits.startswith("91"):
+        phone_number = f"+{raw_digits}"
+    else:
+        phone_number = f"+{raw_digits}" if raw_digits else ""
     lead_id = payload.get("lead_id")
     if not lead_id or lead_id == "test-agent-call":
         import time
@@ -311,9 +535,13 @@ async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Dep
     regional_accent = payload.get("regional_accent", "Default")
 
     api_key = os.environ.get("BOLNA_API_KEY", "").strip()
-    
+
     db = mongodb.get_db()
-    
+
+    allowance = await billing_service.check_call_allowance(db, current_user["company_id"])
+    if not allowance["allowed"]:
+        raise HTTPException(status_code=402, detail=allowance["reason"])
+
     # Fetch real customer name if provided or if lead exists (scoped to this company)
     customer_name = ""
     if payload.get("customer_name") and str(payload.get("customer_name")).strip():
@@ -366,41 +594,50 @@ async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Dep
 
     # If this is a quick call, insert or update the lead in CRM so it shows on the Leads page
     if lead_id.startswith("quick-call-"):
-        await db.leads.insert_one({
-            "lead_id": lead_id,
-            "name": customer_name,
-            "phone": phone_number,
-            "offering": payload.get("offering", ""),
-            "property": payload.get("offering", ""),
-            "location": payload.get("location", ""),
-            "industry": call_industry,
-            "custom_fields": {},
-            "status": "Calling",
-            "aiScore": 0,
-            "lastContact": datetime.utcnow().isoformat(),
-            "created_at": datetime.utcnow(),
-            "company_id": current_user["company_id"]
-        })
+        await db.leads.update_one(
+            {"lead_id": lead_id, "company_id": current_user["company_id"]},
+            {"$set": {
+                "name": customer_name,
+                "phone": phone_number,
+                "offering": payload.get("offering", ""),
+                "property": payload.get("offering", ""),
+                "location": payload.get("location", ""),
+                "industry": call_industry,
+                "status": "Calling",
+                "lastContact": datetime.utcnow().isoformat(),
+            },
+            "$setOnInsert": {
+                "lead_id": lead_id,
+                "custom_fields": {},
+                "aiScore": 0,
+                "created_at": datetime.utcnow(),
+                "company_id": current_user["company_id"]
+            }},
+            upsert=True
+        )
     
-    await db.calls.insert_one({
-        "call_id": lead_id,
-        "customer_id": phone_number,
-        "customer_name": customer_name,
-        "direction": "outbound",
-        "transcript": "",
-        "status": "Initiating",
-        "created_at": datetime.utcnow(),
-        "language": campaign_language,
-        "detected_language": campaign_language,
-        "preferred_language": campaign_language,
-        "transcript_language": campaign_language,
-        "ai_voice": ai_voice,
-        "voice_gender": voice_gender,
-        "regional_accent": regional_accent,
-        "company_id": current_user["company_id"],
-        "campaign_id": lead.get("campaign_id") if 'lead' in locals() and lead else None,
-        "industry": call_industry
-    })
+    await db.calls.update_one(
+        {"call_id": lead_id, "company_id": current_user["company_id"]},
+        {"$set": {
+            "customer_id": phone_number,
+            "customer_name": customer_name,
+            "direction": "outbound",
+            "transcript": "",
+            "status": "Initiating",
+            "created_at": datetime.utcnow(),
+            "language": campaign_language,
+            "detected_language": campaign_language,
+            "preferred_language": campaign_language,
+            "transcript_language": campaign_language,
+            "ai_voice": ai_voice,
+            "voice_gender": voice_gender,
+            "regional_accent": regional_accent,
+            "company_id": current_user["company_id"],
+            "campaign_id": lead.get("campaign_id") if 'lead' in locals() and lead else None,
+            "industry": call_industry
+        }},
+        upsert=True
+    )
 
     url = "https://api.bolna.ai/call"
     headers = {
@@ -429,8 +666,11 @@ async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Dep
     _bp, _wm = _effective_prompt(prompt_doc)
     base_prompt = _bp or "You are an AI sales agent for TalklyAI. Be polite and helpful."
 
-    # Replace variables
-    prompt_text = base_prompt.replace("{{customer_name}}", customer_name)
+    # Replace variables (supports {{customer_name}}, {customer_name}, {{lead_name}}, {lead_name}, etc.)
+    prompt_text = base_prompt
+    name_tags = ["{{customer_name}}", "{customer_name}", "{{lead_name}}", "{lead_name}", "{{name}}", "{name}", "{{lead}}", "{lead}"]
+    for tag in name_tags:
+        prompt_text = prompt_text.replace(tag, customer_name)
     company = await db.companies.find_one({"company_id": current_user["company_id"]})
     company_name_val = company.get("name") if company else "Company"
     
@@ -512,6 +752,68 @@ async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Dep
         }
         bolna_payload["user_data"]["welcome_message"] = welcome_text
 
+    # Direct Plivo Dispatch: If company has a custom Plivo line OR uses Talkly's shared Plivo line
+    plivo_auth_id = None
+    plivo_auth_token = None
+    plivo_from_number = None
+
+    if company_telephony and company_telephony.get("mode") == "custom" and company_telephony.get("provider", "").lower() == "plivo":
+        plivo_auth_id = company_telephony.get("account_sid")
+        plivo_auth_token = company_telephony.get("auth_token")
+        plivo_from_number = company_telephony.get("phone_number")
+    elif not (company_telephony and company_telephony.get("mode") == "custom" and company_telephony.get("provider", "").lower() in ["twilio", "exotel"]):
+        # Shared mode or default: use Talkly's shared Plivo line
+        plivo_auth_id = os.environ.get("PLIVO_AUTH_ID")
+        plivo_auth_token = os.environ.get("PLIVO_AUTH_TOKEN")
+        plivo_from_number = os.environ.get("PLIVO_PHONE_NUMBER") or os.environ.get("TALKLY_SHARED_NUMBER", "+918065535758")
+
+    if plivo_auth_id and plivo_auth_token and plivo_from_number:
+        from telephony.plivo_provider import PlivoProvider
+        plivo_prov = PlivoProvider(plivo_auth_id, plivo_auth_token, default_from=plivo_from_number)
+        try:
+            mode_tag = "Custom Line" if company_telephony and company_telephony.get("mode") == "custom" else "Talkly Shared Line"
+            print(f"Routing call directly via Plivo API ({mode_tag}) from {plivo_from_number} to {phone_number}")
+            plivo_res = await plivo_prov.trigger_outbound_call(
+                to_phone_number=phone_number,
+                lead_id=lead_id,
+                company_id=current_user["company_id"],
+                from_phone_number=plivo_from_number,
+                base_url=current_base_url
+            )
+            await db.calls.update_one(
+                {"call_id": lead_id},
+                {"$set": {
+                    "status": "Initiated",
+                    "provider": "plivo",
+                    "caller_id": plivo_from_number,
+                    "plivo_request_uuid": plivo_res.get("plivo_request_uuid")
+                }}
+            )
+            return {
+                "status": "success",
+                "execution_id": plivo_res.get("plivo_request_uuid"),
+                "provider": "plivo",
+                "caller_id": plivo_from_number,
+                "message": f"Direct Plivo call dispatched successfully from {plivo_from_number} ({mode_tag})"
+            }
+        except Exception as e:
+            print(f"Direct Plivo dispatch error: {e}")
+            await db.calls.update_one({"call_id": lead_id}, {"$set": {"status": "Failed"}})
+            raise HTTPException(status_code=500, detail=f"Plivo Dispatch Error: {str(e)}")
+
+    # Twilio/Exotel custom lines have no working dispatch path today - only
+    # direct Plivo dispatch is implemented, and the Bolna payload below is
+    # dead (Bolna is no longer the live call provider). Previously this fell
+    # through silently and the call just never rang; fail loudly instead so
+    # it's visible rather than looking like a successful dispatch that
+    # mysteriously never connects.
+    if company_telephony and company_telephony.get("mode") == "custom" and company_telephony.get("provider", "").lower() in ["twilio", "exotel"]:
+        await db.calls.update_one({"call_id": lead_id}, {"$set": {"status": "Failed"}})
+        raise HTTPException(
+            status_code=501,
+            detail=f"{company_telephony.get('provider', '').title()} outbound dispatch isn't supported yet - only Plivo (Talkly shared number or a Plivo custom line) can place live calls. Disconnect this line in Settings or connect a Plivo number instead."
+        )
+
     try:
         import json
         with open("payload_dump.json", "w") as f:
@@ -521,6 +823,12 @@ async def trigger_bolna_call(payload: dict = Body(...), current_user: dict = Dep
         print(f"DUMPING BOLNA PAYLOAD: {json.dumps(bolna_payload, indent=2)}")
         response = requests.post(url, json=bolna_payload, headers=headers, timeout=30)
         
+        # Graceful fallback: If Bolna rejects the custom caller ID, retry with default carrier routing
+        if not response.ok and "from_phone_number" in bolna_payload and ("doesn't exist" in response.text or "from_number" in response.text):
+            print(f"Notice: Bolna rejected caller ID {bolna_payload.get('from_phone_number')}, falling back to default routing...")
+            bolna_payload.pop("from_phone_number", None)
+            response = requests.post(url, json=bolna_payload, headers=headers, timeout=30)
+
         if not response.ok:
             await db.calls.update_one({"call_id": lead_id}, {"$set": {"status": "Failed"}})
             raise HTTPException(status_code=response.status_code, detail=f"Bolna Error: {response.text}")
@@ -689,6 +997,39 @@ async def process_bulk_calls(contacts: list, campaign_language: str = "English",
         
         print(f"DEBUG: Parsed name for {phone_str} is -> '{customer_name}'")
         
+        # Direct Plivo Dispatch in Bulk
+        if company_telephony and company_telephony.get("mode") == "custom" and company_telephony.get("provider", "").lower() == "plivo":
+            plivo_auth_id = company_telephony.get("account_sid")
+            plivo_auth_token = company_telephony.get("auth_token")
+            if plivo_auth_id and plivo_auth_token:
+                from telephony.plivo_provider import PlivoProvider
+                plivo_prov = PlivoProvider(plivo_auth_id, plivo_auth_token, default_from=caller_id)
+                try:
+                    print(f"Bulk: Routing directly via Plivo API from dedicated number {caller_id} to {phone_str}")
+                    plivo_res = await plivo_prov.trigger_outbound_call(
+                        to_phone_number=phone_str,
+                        lead_id=lead_id,
+                        company_id=company_id,
+                        from_phone_number=caller_id,
+                        base_url=current_base_url
+                    )
+                    await db.calls.update_one(
+                        {"call_id": lead_id},
+                        {"$set": {
+                            "status": "Initiated",
+                            "provider": "plivo",
+                            "caller_id": caller_id,
+                            "plivo_request_uuid": plivo_res.get("plivo_request_uuid")
+                        }}
+                    )
+                    await asyncio.sleep(0.5)
+                    continue
+                except Exception as e:
+                    print(f"Bulk Plivo dispatch error for {phone_str}: {e}")
+                    await db.calls.update_one({"call_id": lead_id}, {"$set": {"status": "Failed"}})
+                    await asyncio.sleep(0.5)
+                    continue
+
         try:
             import json
             print(f"Triggering Bulk Bolna call to {phone_str} with webhook_url: {bolna_payload['webhook_url']}")
@@ -696,6 +1037,12 @@ async def process_bulk_calls(contacts: list, campaign_language: str = "English",
             # Run blocking request in threadpool
             response = await run_in_threadpool(requests.post, url, json=bolna_payload, headers=headers, timeout=30)
             
+            # Graceful fallback: If Bolna rejects the custom caller ID, retry with default carrier routing
+            if not response.ok and "from_phone_number" in bolna_payload and ("doesn't exist" in response.text or "from_number" in response.text):
+                print(f"Notice: Bolna rejected caller ID {bolna_payload.get('from_phone_number')} in bulk, retrying with default routing...")
+                bolna_payload.pop("from_phone_number", None)
+                response = await run_in_threadpool(requests.post, url, json=bolna_payload, headers=headers, timeout=30)
+
             if response.ok:
                 bolna_data = response.json()
                 execution_id = bolna_data.get("execution_id")
@@ -726,7 +1073,13 @@ async def trigger_bolna_bulk(
 ):
     if not file.filename.endswith(('.xlsx', '.xls', '.csv')):
         raise HTTPException(status_code=400, detail="Only .xlsx and .csv files are supported")
-        
+
+    if not preview_only:
+        db = mongodb.get_db()
+        allowance = await billing_service.check_call_allowance(db, current_user["company_id"])
+        if not allowance["allowed"]:
+            raise HTTPException(status_code=402, detail=allowance["reason"])
+
     contents = await file.read()
     contacts = []
     
@@ -920,23 +1273,34 @@ async def sync_lead_status_from_call(db, lead_id: str, analysis_result: dict):
     ]
     summary_conversion_keywords = [
         "confirmed participation", "confirmed seat", "confirmed demo", "seat confirmed", "booked",
-        "appointment confirmed", "scheduled", "demo session", "masterclass", "site visit", "visit confirmed",
-        "visit scheduled", "consultation confirmed", "sanction quote", "documentation callback",
-        "document verification", "walkthrough", "screen-share", "demo booked"
+        "appointment confirmed", "scheduled demo", "masterclass confirmed", "site visit confirmed",
+        "visit scheduled", "consultation confirmed", "sanction quote",
+        "document verification confirmed", "walkthrough confirmed", "screen-share confirmed", "demo booked"
     ]
 
-    is_converted = (
-        any(i in conversion_intent_keywords for i in intents)
-        or bool(timeline and any(w in str(timeline).lower() for w in ["sat", "sun", "mon", "tue", "wed", "thu", "fri", "am", "pm", "today", "tomorrow", "weekend", "week", "morning", "afternoon", "evening"]))
-        or any(k in summary for k in summary_conversion_keywords)
-        or conv_prob >= 70
+    lead_score = analysis_result.get("lead_score", 0)
+    
+    # Detect if the customer simply asked to call back or was busy (reschedule / low intent)
+    is_callback_or_busy = (
+        bool(timeline and any(cb in str(timeline).lower() for cb in ["call back", "callback", "busy", "reschedule", "later", "not interested"]))
+        or any(cb in summary for cb in ["busy", "call back later", "callback later", "reschedule", "not a good time", "requested for a call back"])
+        or any(i in ["Low Intent Lead", "Not Interested", "Busy"] for i in intents)
     )
+
+    # A lead can only be Converted if they have genuine intent AND are not just asking for a callback while busy
+    is_converted = False
+    if not is_callback_or_busy and lead_temp != "Cold" and lead_score >= 50:
+        is_converted = (
+            any(i in conversion_intent_keywords for i in intents)
+            or conv_prob >= 70
+            or (any(k in summary for k in summary_conversion_keywords) and conv_prob >= 40)
+        )
 
     if is_converted:
         lead_status = "Converted"
-    elif lead_temp == "Hot" or conv_prob >= 50 or analysis_result.get("lead_score", 0) >= 75:
+    elif lead_temp == "Hot" or conv_prob >= 50 or lead_score >= 75:
         lead_status = "Qualified"
-    elif lead_temp in ["Warm", "Hot"] or analysis_result.get("lead_score", 0) >= 40:
+    elif (lead_temp in ["Warm", "Hot"] or lead_score >= 40) and not (lead_temp == "Cold" and lead_score < 30):
         lead_status = "Interested"
     else:
         lead_status = "Contacted"

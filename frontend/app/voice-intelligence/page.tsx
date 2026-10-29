@@ -139,8 +139,8 @@ export default function VoiceIntelligencePage() {
             <h2 className="text-lg font-bold">Recent Analyses</h2>
           </div>
           <div className="divide-y divide-border">
-            {history.map((item: any) => (
-              <div key={item.call_id} className="p-5 flex items-center justify-between hover:bg-muted/30 transition-colors cursor-pointer" onClick={() => setResult(item)}>
+            {history.map((item: any, idx: number) => (
+              <div key={item.call_id ? `${item.call_id}-${idx}` : idx} className="p-5 flex items-center justify-between hover:bg-muted/30 transition-colors cursor-pointer" onClick={() => setResult(item)}>
                 <div className="flex items-center gap-4">
                   <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
                     <FileText size={18} />

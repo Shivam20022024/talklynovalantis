@@ -14,7 +14,6 @@ import {
   Layers,
   MoreHorizontal,
   Phone,
-  Plus,
   ShieldCheck,
   Sparkles,
   Stethoscope,
@@ -254,15 +253,6 @@ export default function DashboardPage() {
             <Download size={14} className="stroke-[2.5]" />
             Export
           </button>
-
-          {/* Create Campaign CTA */}
-          <Link 
-            href="/campaigns" 
-            className="flex items-center gap-1.5 rounded-lg bg-primary px-3.5 py-2 text-xs font-bold text-primary-foreground shadow-sm shadow-primary/25 hover:opacity-90"
-          >
-            <Plus size={14} className="stroke-[2.5]" />
-            Create Campaign
-          </Link>
         </div>
       </section>
 

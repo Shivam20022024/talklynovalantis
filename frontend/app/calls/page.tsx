@@ -15,7 +15,7 @@ import {
   Trash2
 } from 'lucide-react'
 import AppLayout from '@/components/layout/AppLayout'
-import { fetchApi } from '@/lib/api'
+import { fetchApi, fetchBlob, downloadBlob } from '@/lib/api'
 
 export default function CallsPage() {
   const [calls, setCalls] = useState<any[]>([])
@@ -26,6 +26,7 @@ export default function CallsPage() {
   const [selectedCall, setSelectedCall] = useState<any>(null)
   const [hasMore, setHasMore] = useState(true)
   const [selectedCalls, setSelectedCalls] = useState<string[]>([])
+  const [exporting, setExporting] = useState(false)
   const LIMIT = 20
 
   const loadCalls = async (pageNum: number) => {
@@ -54,16 +55,16 @@ export default function CallsPage() {
     loadCalls(page)
   }, [page])
 
-  const handleDownload = () => {
-    if (calls.length === 0) return alert("No data to download")
-    const csv = ["Call ID,Customer,Phone,Direction,Duration,Status,Sentiment"]
-    calls.forEach(c => csv.push(`${c.call_id},${c.customer_name},${c.customer_phone || ''},${c.direction},${c.duration_seconds},${c.status},${c.sentiment}`))
-    const blob = new Blob([csv.join('\n')], { type: 'text/csv' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = 'calls_export.csv'
-    a.click()
+  const handleDownload = async (direction: 'outbound' | 'inbound') => {
+    setExporting(true)
+    try {
+      const blob = await fetchBlob(`/api/v1/calls/export?direction=${direction}`)
+      downloadBlob(blob, `talkly_${direction}_calls.xlsx`)
+    } catch (e: any) {
+      alert(e.message || 'Failed to export calls')
+    } finally {
+      setExporting(false)
+    }
   }
 
   const handleDeleteSelected = async () => {
@@ -127,7 +128,22 @@ export default function CallsPage() {
               <option value="Completed">Completed</option>
             </select>
             <button onClick={handleDeleteSelected} disabled={selectedCalls.length === 0} className={`flex h-9 items-center gap-2 rounded-lg px-3.5 text-xs font-semibold transition-colors ${selectedCalls.length > 0 ? 'bg-primary text-primary-foreground shadow-lg shadow-primary/20 hover:opacity-90' : 'bg-muted text-muted-foreground hover:bg-muted/80 disabled:opacity-50'}`}><Trash2 size={15} />Delete Selected</button>
-            <button onClick={handleDownload} className="flex h-9 w-9 items-center justify-center rounded-lg border border-border bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"><Download size={15} /></button>
+            <button
+              onClick={() => handleDownload('outbound')}
+              disabled={exporting}
+              title="Export outbound calls to Excel"
+              className="flex h-9 items-center gap-2 rounded-lg border border-border bg-muted/50 px-3 text-xs font-semibold text-muted-foreground hover:bg-muted hover:text-foreground transition-colors disabled:opacity-50"
+            >
+              <Download size={14} />Outbound (.xlsx)
+            </button>
+            <button
+              onClick={() => handleDownload('inbound')}
+              disabled={exporting}
+              title="Export inbound calls to Excel"
+              className="flex h-9 items-center gap-2 rounded-lg border border-border bg-muted/50 px-3 text-xs font-semibold text-muted-foreground hover:bg-muted hover:text-foreground transition-colors disabled:opacity-50"
+            >
+              <Download size={14} />Inbound (.xlsx)
+            </button>
           </div>
         </div>
         
@@ -158,10 +174,17 @@ export default function CallsPage() {
                 </tr>
               </thead>
               <tbody>
-                {visibleCalls.map((call) => {
+                {visibleCalls.map((call, idx) => {
                   const durationSecs = call.duration_seconds || 0;
                   const hasDuration = !!call.duration || durationSecs > 0;
-                  const isNotReceived = !hasDuration || call.duration === '00:00' || call.duration === '0';
+                  // Missing duration alone doesn't mean the call wasn't
+                  // received - Plivo's hangup webhook isn't wired for every
+                  // call path, so older records may have a real
+                  // transcript/analysis but no duration. Only call it
+                  // "Not Received" when there's no other evidence it connected.
+                  const explicitZero = call.duration === '00:00' || call.duration === '0';
+                  const wasReceived = !explicitZero && (hasDuration || !!call.transcript || ['Analyzed', 'Completed', 'In Progress'].includes(call.status));
+                  const isNotReceived = !wasReceived;
                   const displayStatus = isNotReceived ? 'Not Received' : call.status;
                   
                   const formatDuration = (secs: number) => {
@@ -172,7 +195,7 @@ export default function CallsPage() {
                   const durationDisplay = isNotReceived ? '--:--' : (call.duration || formatDuration(durationSecs));
                   
                   return (
-                  <tr key={call.call_id} className="border-b border-border/50 h-16 last:border-0 hover:bg-muted/30">
+                  <tr key={`${call._id || call.call_id || 'call'}-${idx}`} className="border-b border-border/50 h-16 last:border-0 hover:bg-muted/30">
                     <td className="pl-4">
                       <input 
                         type="checkbox" 

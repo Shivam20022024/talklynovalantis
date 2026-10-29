@@ -268,6 +268,18 @@ async def company_billing(company_id: str, current_user: dict = Depends(require_
     return {"status": "success", "data": {"wallet": wallet, "usage": usage}}
 
 
+@admin_router.post("/companies/{company_id}/reconcile-wallet")
+async def reconcile_company_wallet(company_id: str, current_user: dict = Depends(require_super_admin)):
+    """Recompute this company's wallet.balance from its own transaction
+    ledger and correct any drift (e.g. left over from the pre-$inc race
+    condition). Safe to call repeatedly - a no-op once balance matches."""
+    db = mongodb.get_db()
+    await _require_company(db, company_id)
+    from services.billing_service import billing_service
+    result = await billing_service.reconcile_wallet(db, company_id)
+    return {"status": "success", "data": result}
+
+
 @admin_router.get("/companies/{company_id}/prompt")
 async def company_prompt(company_id: str, current_user: dict = Depends(require_super_admin)):
     db = mongodb.get_db()

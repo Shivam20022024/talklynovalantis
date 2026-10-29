@@ -8,7 +8,7 @@ import { usePathname, useRouter } from 'next/navigation';
 import { useAuth } from '@/components/providers/AuthProvider';
 
 const COMPANY_ADMIN_ONLY_PREFIXES = [
-  '/dashboard', '/leads', '/campaigns', '/calls', '/prompt', '/agent',
+  '/dashboard', '/leads', '/campaigns', '/calls', '/inbound-calls', '/prompt', '/agent',
   '/voice-intelligence', '/analytics', '/team',
 ];
 

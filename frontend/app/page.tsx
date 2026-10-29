@@ -6,7 +6,6 @@ import { HeroSection } from '@/components/landing/HeroSection';
 import { ValuePropSection } from '@/components/landing/ValuePropSection';
 import { CapabilitiesSection } from '@/components/landing/CapabilitiesSection';
 import { WorkflowSection } from '@/components/landing/WorkflowSection';
-import { PricingSection } from '@/components/landing/PricingSection';
 import { CTASection } from '@/components/landing/CTASection';
 import { Footer } from '@/components/landing/Footer';
 
@@ -24,7 +23,6 @@ const LandingPage = () => {
         <ValuePropSection />
         <CapabilitiesSection />
         <WorkflowSection />
-        <PricingSection />
         <CTASection onStart={handleStart} />
       </main>
       <Footer />

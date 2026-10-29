@@ -12,9 +12,11 @@ import {
   Plus, 
   RefreshCw, 
   CheckCircle2, 
-  ArrowDownLeft, 
-  ArrowUpRight, 
-  X, 
+  ArrowDownLeft,
+  ArrowUpRight,
+  PhoneIncoming,
+  PhoneOutgoing,
+  X,
   Loader2, 
   Sparkles,
   ShieldCheck,
@@ -31,6 +33,11 @@ interface DashboardData {
   minutes_included: number
   minutes_remaining: number
   total_spending: number
+  breakdown?: {
+    outbound?: { minutes: number; spending: number }
+    inbound?: { minutes: number; spending: number }
+    [key: string]: { minutes: number; spending: number } | undefined
+  }
   total_calls: number
   completed_calls: number
   rate_per_minute: number
@@ -77,6 +84,15 @@ export default function BillingPage() {
   const [customAmount, setCustomAmount] = useState<string>('')
   const [toppingUp, setToppingUp] = useState(false)
 
+  useEffect(() => {
+    if (document.getElementById('razorpay-checkout-js')) return
+    const script = document.createElement('script')
+    script.id = 'razorpay-checkout-js'
+    script.src = 'https://checkout.razorpay.com/v1/checkout.js'
+    script.async = true
+    document.body.appendChild(script)
+  }, [])
+
   const loadData = async (isRefresh = false) => {
     if (isRefresh) setRefreshing(true)
     else setLoading(true)
@@ -111,22 +127,58 @@ export default function BillingPage() {
       return
     }
 
+    if (typeof (window as any).Razorpay === 'undefined') {
+      alert('Payment gateway is still loading, please try again in a moment.')
+      return
+    }
+
     setToppingUp(true)
     try {
-      await fetchApi('/api/v1/billing/wallet/topup', {
+      const { order } = await fetchApi('/api/v1/billing/wallet/razorpay/create-order', {
         method: 'POST',
-        body: JSON.stringify({
-          amount: amountToCharge,
-          description: `Direct wallet recharge of ₹${amountToCharge.toFixed(2)}`
-        })
+        body: JSON.stringify({ amount: amountToCharge, currency: 'INR' })
       })
-      alert(`₹${amountToCharge.toFixed(2)} credited successfully to your TalklyAI wallet!`)
-      setShowTopupModal(false)
-      setCustomAmount('')
-      loadData(true)
+
+      const rzp = new (window as any).Razorpay({
+        key: order.key_id,
+        order_id: order.id,
+        amount: order.amount,
+        currency: order.currency,
+        name: 'TalklyAI',
+        description: 'Wallet Recharge',
+        prefill: dashboard?.company_name ? { name: dashboard.company_name } : undefined,
+        theme: { color: '#000000' },
+        handler: async (response: any) => {
+          try {
+            await fetchApi('/api/v1/billing/wallet/razorpay/verify-payment', {
+              method: 'POST',
+              body: JSON.stringify({
+                razorpay_order_id: response.razorpay_order_id,
+                razorpay_payment_id: response.razorpay_payment_id,
+                razorpay_signature: response.razorpay_signature
+              })
+            })
+            alert(`₹${amountToCharge.toFixed(2)} credited successfully to your TalklyAI wallet!`)
+            setShowTopupModal(false)
+            setCustomAmount('')
+            loadData(true)
+          } catch (err: any) {
+            alert(`Payment succeeded but wallet credit failed - contact support: ${err.message}`)
+          } finally {
+            setToppingUp(false)
+          }
+        },
+        modal: {
+          ondismiss: () => setToppingUp(false)
+        }
+      })
+      rzp.on('payment.failed', (resp: any) => {
+        alert(`Payment failed: ${resp.error?.description || 'Please try again.'}`)
+        setToppingUp(false)
+      })
+      rzp.open()
     } catch (e: any) {
       alert(`Recharge failed: ${e.message}`)
-    } finally {
       setToppingUp(false)
     }
   }
@@ -179,10 +231,10 @@ export default function BillingPage() {
             </div>
             <div>
               <p className="font-semibold text-foreground">
-                Free Trial Active • ₹100 Welcome Credit Included
+                Free Trial Active • {dashboard.minutes_included} Free Minutes Included
               </p>
               <p className="text-xs text-muted-foreground">
-                Your account was credited with ₹100 (~10 minutes) for testing out live AI voice calling.
+                You get {dashboard.minutes_included} minutes of free AI calling (any mix of inbound/outbound) to test things out — {dashboard.minutes_remaining} remaining.
               </p>
             </div>
           </div>
@@ -294,6 +346,51 @@ export default function BillingPage() {
           </p>
         </div>
       </section>
+
+      {/* Inbound vs Outbound Breakdown */}
+      {dashboard?.breakdown && (
+        <section className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div className="rounded-xl border border-border bg-card p-5 shadow-sm">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold tracking-wider text-muted-foreground uppercase">
+                Outbound Calls
+              </span>
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                <PhoneOutgoing size={16} />
+              </div>
+            </div>
+            <div className="mt-3 flex items-baseline gap-2">
+              <span className="text-2xl font-extrabold tracking-tight text-foreground">
+                {dashboard.breakdown.outbound?.minutes ?? 0}
+              </span>
+              <span className="text-xs text-muted-foreground">mins used</span>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              ₹{(dashboard.breakdown.outbound?.spending ?? 0).toFixed(2)} spent • calls you placed
+            </p>
+          </div>
+
+          <div className="rounded-xl border border-border bg-card p-5 shadow-sm">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold tracking-wider text-muted-foreground uppercase">
+                Inbound Calls
+              </span>
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-violet-500/10 text-violet-600 dark:text-violet-400">
+                <PhoneIncoming size={16} />
+              </div>
+            </div>
+            <div className="mt-3 flex items-baseline gap-2">
+              <span className="text-2xl font-extrabold tracking-tight text-foreground">
+                {dashboard.breakdown.inbound?.minutes ?? 0}
+              </span>
+              <span className="text-xs text-muted-foreground">mins used</span>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              ₹{(dashboard.breakdown.inbound?.spending ?? 0).toFixed(2)} spent • calls customers placed to you
+            </p>
+          </div>
+        </section>
+      )}
 
       {/* Tabs & Detailed Tables Section */}
       <section className="mt-8 rounded-xl border border-border bg-card shadow-sm overflow-hidden">

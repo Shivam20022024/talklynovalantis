@@ -12,11 +12,13 @@ import {
   Stethoscope,
   GraduationCap,
   CreditCard,
-  Briefcase
+  Briefcase,
+  Mic
 } from 'lucide-react'
 import AppLayout from '@/components/layout/AppLayout'
 import { fetchApi } from '@/lib/api'
 import { useAuth } from '@/components/providers/AuthProvider'
+import LiveVoicePlayground from '@/components/voice/LiveVoicePlayground'
 
 interface IndustryTemplate {
   id: string
@@ -26,6 +28,8 @@ interface IndustryTemplate {
   default_offering_label: string
   welcome_message: string
   prompt: string
+  inbound_welcome_message: string
+  inbound_prompt: string
   variables: string[]
 }
 
@@ -46,6 +50,16 @@ Key Objectives:
 3. Highlight Key Selling Points: Mention location connectivity, luxury amenities, and ongoing spot-booking offers.
 4. Schedule Site Visit: Propose a convenient time (e.g., this weekend or tomorrow morning) for a guided site tour.
 5. Tone: Polite, consultative, respectful, and persistent without being pushy. Reply naturally in the customer's language (Hindi, English, or Hinglish).`,
+    inbound_welcome_message: "नमस्ते {{customer_name}}, {{company_name}} में कॉल करने के लिए धन्यवाद। आप हमारे {{offering}} के बारे में जानकारी के लिए कॉल कर रहे हैं - मैं आपकी कैसे मदद कर सकती हूँ?",
+    inbound_prompt: `आप {{company_name}} के लिए एक पेशेवर रियल एस्टेट इनबाउंड कंसल्टेंट हैं। एक संभावित ग्राहक ने आपकी हेल्पलाइन पर कॉल किया है।
+
+मुख्य उद्देश्य:
+1. ध्यान से सुनें: ग्राहक की पूछताछ को ध्यान से सुनें - वे {{offering}} या किसी अन्य प्रॉपर्टी में रुचि ले सकते हैं।
+2. जानकारी दें: लोकेशन, कॉन्फ़िगरेशन (2BHK/3BHK/विला), कीमत रेंज और उपलब्धता के बारे में स्पष्ट और संक्षिप्त जवाब दें।
+3. जरूरतें समझें: उनका बजट रेंज और पसंदीदा लोकेशन पूछें।
+4. साइट विज़िट ऑफर करें: एक सुविधाजनक समय पर साइट विज़िट शेड्यूल करने का सुझाव दें।
+5. टोन: विनम्र, सहायक, और ग्राहक की भाषा (हिंदी/इंग्लिश/हिंग्लिश) में स्वाभाविक रूप से जवाब दें।
+6. विदाई: संतुष्ट होने पर गर्मजोशी से विदाई लें और end_call फंक्शन को कॉल करें।`,
     variables: ["{{company_name}}", "{{customer_name}}", "{{offering}}", "{{location}}", "{{budget}}"]
   },
   healthcare: {
@@ -54,16 +68,26 @@ Key Objectives:
     icon: "Stethoscope",
     description: "Confirm doctor appointments, clinic timings, and collect visit notes.",
     default_offering_label: "Doctor / Clinic Specialty",
-    welcome_message: "Hello {{customer_name}}, I am calling from {{company_name}}. I am reaching out regarding your appointment request for {{offering}}. Is this a good time to speak for a moment?",
+    welcome_message: "नमस्ते {{customer_name}}, मैं {{company_name}} से बोल रही हूँ। आपके {{offering}} के लिए अपॉइंटमेंट के सिलसिले में बात करने के लिए कॉल किया है। क्या अभी बात करने का सही समय है?",
     prompt: `You are a compassionate, professional clinic coordinator for {{company_name}}.
-Your goal is to assist {{customer_name}} with their medical consultation inquiry for {{offering}}.
+Your goal is to assist {{customer_name}} with booking their medical consultation appointment for {{offering}} at {{location}}.
 
 Key Objectives:
-1. Warm Greeting: Confirm you are speaking with {{customer_name}} regarding their inquiry for {{offering}}.
-2. Gather Needs: Inquire politely about their preferred consultation day (weekday or weekend) and time slot (morning/evening).
-3. Inform Clinic Policies: Mention doctor availability, clinic location ({{location}}), and consultation charges if asked.
-4. Confirm Appointment: Lock in a tentative consultation slot and inform them that an SMS/WhatsApp reminder will follow.
-5. Tone: Empathetic, calm, reassuring, and confidential. If the customer reports a medical emergency, immediately advise them to visit the nearest emergency room.`,
+1. Warm Greeting: Acknowledge their inquiry for {{offering}}.
+2. Language: Speak fluently and naturally in Hindi (or Hinglish/English according to customer preference). If the customer speaks Hindi or asks for Hindi, speak completely in polite, natural Hindi.
+3. Gather Needs: Inquire politely about their preferred consultation day (weekday or weekend) and time slot (morning/evening, e.g. "क्या आप वीकेंड या किसी खास दिन आना चाहेंगे?").
+4. Confirm Appointment: Lock in their chosen consultation slot (e.g. Sunday evening at 5 PM), confirm doctor availability at {{location}}, and inform them that an SMS/WhatsApp confirmation will follow.
+5. Polite Closing & End Call: Conclude politely with "बहुत-बहुत धन्यवाद, आपका अपॉइंटमेंट तय कर दिया गया है। आपका दिन शुभ हो! अलविदा।" and call the end_call tool to finish the call.
+6. Tone: Empathetic, calm, respectful, and concise (1 to 2 short sentences per turn).`,
+    inbound_welcome_message: "Hello {{customer_name}}, thank you for calling {{company_name}}. How may I assist you today?",
+    inbound_prompt: `You are a compassionate clinic receptionist for {{company_name}}. A patient or their family member has called your direct helpline.
+
+Key Objectives:
+1. Listen First: Understand what they're calling about - a new appointment, confirming an existing one, or general information.
+2. Share Information: Give clear details on {{offering}} availability, clinic timings, and location.
+3. Book the Appointment: Ask their preferred day and time slot and confirm it immediately.
+4. Tone: Calm, empathetic, concise (1 to 2 short sentences per turn).
+5. Closing: End warmly and invoke the end_call function.`,
     variables: ["{{company_name}}", "{{customer_name}}", "{{offering}}", "{{location}}", "{{doctor_name}}", "{{preferred_time}}"]
   },
   edtech: {
@@ -82,6 +106,16 @@ Key Objectives:
 3. Program Value: Highlight industry-led projects, guaranteed placement support, flexible weekend batches, and mentor guidance.
 4. Free Demo / Counseling: Invite them to attend a free live workshop or schedule a 1-on-1 career roadmap call this week.
 5. Tone: Motivating, encouraging, informative, and professional.`,
+    inbound_welcome_message: "Hi {{customer_name}}, thanks for calling {{company_name}}! How can I help you today?",
+    inbound_prompt: `You are a friendly admissions counselor for {{company_name}}, answering an inbound call from a prospective student or parent.
+
+Key Objectives:
+1. Listen First: Understand what they're calling about - a specific program ({{offering}}), fees, batch timings, or admission process.
+2. Answer Clearly: Give concise, accurate answers in 1-2 short sentences per turn.
+3. Qualify Gently: Ask whether they're a student, working professional, or parent inquiring on behalf of someone else.
+4. Offer Next Step: Invite them to a free demo class or a 1-on-1 counseling call this week.
+5. Tone: Warm, informative, encouraging, and professional.
+6. Closing: Once satisfied, say a warm goodbye and invoke the end_call function.`,
     variables: ["{{company_name}}", "{{customer_name}}", "{{offering}}", "{{batch_time}}", "{{current_role}}"]
   },
   bfsi: {
@@ -100,6 +134,16 @@ Key Objectives:
 3. Value Proposition: Mention competitive interest rates, zero foreclosure charges (if applicable), and same-day instant pre-approval.
 4. Next Step: Confirm their interest in receiving a customized sanction quote and schedule a documentation callback.
 5. Tone: Trustworthy, professional, compliant, and discreet.`,
+    inbound_welcome_message: "Hello {{customer_name}}, thank you for calling {{company_name}}. How may I assist you today?",
+    inbound_prompt: `You are a professional financial services representative for {{company_name}}, answering an inbound call.
+
+Key Objectives:
+1. Listen First: Understand the caller's need - a new loan/insurance inquiry about {{offering}}, application status, or document submission.
+2. Answer Clearly: Share eligibility basics, required documents, and processing timelines concisely.
+3. Qualify: Ask about loan/coverage amount needed and employment type if relevant.
+4. Next Step: Offer to schedule a callback from a senior advisor or send details over WhatsApp.
+5. Tone: Trustworthy, professional, compliant, and discreet.
+6. Closing: Say a warm goodbye and invoke the end_call function.`,
     variables: ["{{company_name}}", "{{customer_name}}", "{{offering}}", "{{loan_amount}}", "{{tenure}}"]
   },
   general_sales: {
@@ -110,14 +154,26 @@ Key Objectives:
     default_offering_label: "Product / Service Solution",
     welcome_message: "Hi {{customer_name}}, this is {{company_name}} reaching out. I noticed your interest in our {{offering}} solutions. Do you have a brief moment?",
     prompt: `You are an outbound sales development representative (SDR) for {{company_name}}.
-Your goal is to uncover business challenges and schedule a 15-minute executive walkthrough of {{offering}}.
+Your goal is to uncover business challenges around calling and lead management, and schedule a 15-minute executive walkthrough of {{offering}}.
+
+Key Questions and Flow to ask in order:
+1. Warm Introduction: Acknowledge speaking with {{customer_name}} and confirm if they have a quick minute.
+2. Discovery & Qualification: Ask what solution or process they currently use for customer calling and lead follow-up, and what workflow bottlenecks or challenges they face.
+3. Value Pitch: Share that {{company_name}} helps teams automate customer calling, qualify leads instantly with human-like AI, and reduce operational costs by up to 40%.
+4. Call to Action: Propose a 15-minute live screen-share demo with your specialist. Specifically ask: "Would Tuesday or Thursday morning work better for a quick 15-minute demo?"
+5. Language & Accent: Speak with a natural, polite Indian English accent. If the customer speaks in Hindi or asks for Hindi ('हिंदी में बात करो'), converse naturally and fluently in polite Hindi.
+6. Tone: Consultative, articulate, respectful, and concise (1 to 2 short sentences per turn).
+7. Wrap-up & Auto Hangup: Once they select a day/time, confirm the demo, say a warm goodbye, and execute the end_call function.`,
+    inbound_welcome_message: "Hi {{customer_name}}, thanks for calling {{company_name}}. How can I help you today?",
+    inbound_prompt: `You are a knowledgeable inbound sales representative for {{company_name}}, answering a call from a prospect or existing customer.
 
 Key Objectives:
-1. Introduction: Briefly state the purpose of the call and connect it to {{offering}}.
-2. Qualification: Ask what solution they are currently using and where they experience workflow bottlenecks.
-3. Value Pitch: Explain how {{company_name}} helps businesses increase efficiency and reduce operational costs by up to 40%.
-4. Call to Action: Propose a quick 15-minute screen-share demo with your product specialist this Tuesday or Thursday.
-5. Tone: Confident, articulate, consultative, and concise.`,
+1. Listen First: Understand what the caller needs - product information about {{offering}}, pricing, a demo, or support.
+2. Answer Clearly: Give concise, helpful answers (1-2 short sentences per turn).
+3. Qualify Gently: Ask about their team size or use case if it's a new inquiry.
+4. Offer Next Step: Propose a 15-minute demo or connect them with the right specialist.
+5. Language & Accent: Speak with a natural, polite Indian English accent, switching to Hindi if the caller does.
+6. Closing: Once their question is resolved, say a warm goodbye and invoke the end_call function.`,
     variables: ["{{company_name}}", "{{customer_name}}", "{{offering}}", "{{company_size}}", "{{industry}}"]
   }
 }
@@ -126,10 +182,14 @@ export default function PromptPage() {
   const { user } = useAuth()
   const [promptText, setPromptText] = useState("Loading...")
   const [welcomeMessage, setWelcomeMessage] = useState("Loading...")
+  const [inboundPromptText, setInboundPromptText] = useState("Loading...")
+  const [inboundWelcomeMessage, setInboundWelcomeMessage] = useState("Loading...")
+  const [activeDirection, setActiveDirection] = useState<'outbound' | 'inbound'>('outbound')
   const [saving, setSaving] = useState(false)
   const [publishing, setPublishing] = useState(false)
   const [promptStatus, setPromptStatus] = useState<string>('Draft')
   const [showTestModal, setShowTestModal] = useState(false)
+  const [showLiveVoicePlayground, setShowLiveVoicePlayground] = useState(false)
   const [testPhone, setTestPhone] = useState('')
   const [selectedIndustry, setSelectedIndustry] = useState<string>('healthcare')
 
@@ -156,22 +216,46 @@ export default function PromptPage() {
           if (data.welcome_message) setWelcomeMessage(data.welcome_message)
           else setWelcomeMessage("नमस्ते {{customer_name}}, मैं {{company_name}} की तरफ से बोल रहा हूँ। क्या अभी 2 मिनट बात करना convenient है?")
           if (data.prompt_status) setPromptStatus(data.prompt_status)
+          // Fall back to the caller's own industry template, not the
+          // `selectedIndustry` state default - this effect can run before the
+          // separate [user?.industry] effect below has corrected that state,
+          // so closing over `selectedIndustry` here risked silently saving
+          // the wrong industry's inbound script on first publish.
+          const fallbackIndustry = (user?.industry && CLIENT_TEMPLATES[user.industry]) ? user.industry : selectedIndustry
+          if (data.inbound_prompt) setInboundPromptText(data.inbound_prompt)
+          else setInboundPromptText(CLIENT_TEMPLATES[fallbackIndustry]?.inbound_prompt || '')
+          if (data.inbound_welcome_message) setInboundWelcomeMessage(data.inbound_welcome_message)
+          else setInboundWelcomeMessage(CLIENT_TEMPLATES[fallbackIndustry]?.inbound_welcome_message || '')
         }
       } catch (e) {
         console.error("Failed to load prompt")
       }
     }
     fetchPrompt()
-  }, [])
+  }, [user?.industry])
 
-  const handleApplyTemplate = (key: string) => {
+  const handleApplyTemplate = async (key: string) => {
     const tmpl = CLIENT_TEMPLATES[key]
     if (!tmpl) return
-    if (confirm(`Load the "${tmpl.name}" preset? This will overwrite your draft prompt and welcome message.`)) {
+    if (confirm(`Load the "${tmpl.name}" preset? This will update your prompt and welcome message.`)) {
       setSelectedIndustry(key)
       setPromptText(tmpl.prompt)
       setWelcomeMessage(tmpl.welcome_message)
+      setInboundPromptText(tmpl.inbound_prompt)
+      setInboundWelcomeMessage(tmpl.inbound_welcome_message)
       setPromptStatus('Draft')
+      try {
+        await fetchApi('/api/v1/prompt', {
+          method: 'POST',
+          body: JSON.stringify({
+            prompt: tmpl.prompt, welcome_message: tmpl.welcome_message,
+            inbound_prompt: tmpl.inbound_prompt, inbound_welcome_message: tmpl.inbound_welcome_message,
+            industry: key
+          })
+        })
+      } catch (err) {
+        console.error('Failed to auto-save template draft', err)
+      }
     }
   }
 
@@ -180,7 +264,11 @@ export default function PromptPage() {
     try {
       await fetchApi('/api/v1/prompt', {
         method: 'POST',
-        body: JSON.stringify({ prompt: promptText, welcome_message: welcomeMessage })
+        body: JSON.stringify({
+          prompt: promptText, welcome_message: welcomeMessage,
+          inbound_prompt: inboundPromptText, inbound_welcome_message: inboundWelcomeMessage,
+          industry: selectedIndustry
+        })
       })
       setPromptStatus('Draft')
       alert("Draft saved.")
@@ -192,16 +280,27 @@ export default function PromptPage() {
   }
 
   const handlePublish = async () => {
-    if (!confirm('Publish this prompt to your company’s live AI agent?')) return
+    if (!confirm('Publish this prompt to your company’s live AI agent? This updates both your outbound and inbound call scripts.')) return
     setPublishing(true)
     try {
       await fetchApi('/api/v1/prompt', {
         method: 'POST',
-        body: JSON.stringify({ prompt: promptText, welcome_message: welcomeMessage })
+        body: JSON.stringify({
+          prompt: promptText, welcome_message: welcomeMessage,
+          inbound_prompt: inboundPromptText, inbound_welcome_message: inboundWelcomeMessage,
+          industry: selectedIndustry
+        })
       })
-      const res = await fetchApi('/api/v1/prompt/publish', { method: 'POST', body: JSON.stringify({}) })
+      await fetchApi('/api/v1/prompt/publish', {
+        method: 'POST',
+        body: JSON.stringify({
+          prompt: promptText, welcome_message: welcomeMessage,
+          inbound_prompt: inboundPromptText, inbound_welcome_message: inboundWelcomeMessage,
+          industry: selectedIndustry
+        })
+      })
       setPromptStatus('Published')
-      alert(res.bolna_synced ? 'Published and synced to your Bolna agent.' : 'Published (Bolna sync skipped — check agent config).')
+      alert(`Published! Live AI agent is now configured with the ${CLIENT_TEMPLATES[selectedIndustry]?.name || ''} template.`)
     } catch (e: any) {
       alert(e.message || 'Failed to publish.')
     } finally {
@@ -237,9 +336,16 @@ export default function PromptPage() {
           <h1 className="mt-2 text-3xl font-bold tracking-[-0.06em] sm:text-[34px]">Agent Configuration</h1>
           <p className="mt-2 text-sm text-muted-foreground">Manage your AI agent's instructions, use-case presets, and behavior.</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={() => setShowLiveVoicePlayground(true)}
+            className="flex items-center gap-2 rounded-lg px-3.5 py-2.5 text-xs font-bold shadow-md hover:opacity-90 transition-all cursor-pointer"
+            style={{ backgroundColor: '#059669', color: '#ffffff' }}
+          >
+            <Mic size={15} className="text-white" /> Test in Browser (LiveKit)
+          </button>
           <button onClick={() => setShowTestModal(true)} className="flex items-center gap-2 rounded-lg border border-border bg-card px-3.5 py-2.5 text-xs font-semibold hover:bg-muted">
-            <Play size={15} />Test Agent
+            <Play size={15} />Test on Phone
           </button>
           <button onClick={handleSave} disabled={saving} className="flex items-center gap-2 rounded-lg border border-border bg-card px-3.5 py-2.5 text-xs font-semibold hover:bg-muted disabled:opacity-50">
             <Save size={15} />{saving ? "Saving..." : "Save Draft"}
@@ -331,29 +437,66 @@ export default function PromptPage() {
             </span>
           </div>
 
+          {/* Outbound / Inbound Direction Tabs */}
+          <div className="mt-4 inline-flex rounded-lg border border-border bg-muted/40 p-1">
+            <button
+              type="button"
+              onClick={() => setActiveDirection('outbound')}
+              className={`rounded-md px-4 py-1.5 text-xs font-bold transition-all ${activeDirection === 'outbound' ? 'bg-card shadow-sm text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+            >
+              Outbound Calls (You call them)
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveDirection('inbound')}
+              className={`rounded-md px-4 py-1.5 text-xs font-bold transition-all ${activeDirection === 'inbound' ? 'bg-card shadow-sm text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+            >
+              Inbound Calls (They call you)
+            </button>
+          </div>
+          <p className="mt-2 text-xs text-muted-foreground">
+            {activeDirection === 'outbound'
+              ? 'This script is used when your AI agent initiates the call to a lead or customer.'
+              : 'This script is used when a customer calls your dedicated or shared Talkly number directly - it starts by listening, not pitching.'}
+          </p>
+
           <div className="mt-5 space-y-6">
-            
+
             {/* Welcome Message Section */}
             <div>
-              <h2 className="text-sm font-bold text-foreground">Agent Welcome Message</h2>
-              <p className="mt-0.5 mb-2.5 text-xs text-muted-foreground">The very first sentence your AI agent speaks when the prospect picks up.</p>
+              <h2 className="text-sm font-bold text-foreground">
+                {activeDirection === 'outbound' ? 'Agent Welcome Message' : 'Inbound Greeting'}
+              </h2>
+              <p className="mt-0.5 mb-2.5 text-xs text-muted-foreground">
+                {activeDirection === 'outbound'
+                  ? 'The very first sentence your AI agent speaks when the prospect picks up.'
+                  : 'The very first sentence your AI agent speaks when it answers an incoming call.'}
+              </p>
               <textarea
-                value={welcomeMessage}
-                onChange={(e) => setWelcomeMessage(e.target.value)}
+                value={activeDirection === 'outbound' ? welcomeMessage : inboundWelcomeMessage}
+                onChange={(e) => activeDirection === 'outbound' ? setWelcomeMessage(e.target.value) : setInboundWelcomeMessage(e.target.value)}
                 className="w-full resize-y rounded-xl border border-border bg-background p-4 text-sm font-mono leading-relaxed outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 min-h-[90px]"
-                placeholder="e.g. Hello {{customer_name}}, this is {{company_name}} calling regarding {{offering}}..."
+                placeholder={activeDirection === 'outbound'
+                  ? "e.g. Hello {{customer_name}}, this is {{company_name}} calling regarding {{offering}}..."
+                  : "e.g. Hello, thank you for calling {{company_name}}! How may I help you today?"}
               />
             </div>
 
             {/* System Prompt Section */}
             <div className="border-t border-border pt-6">
-              <h2 className="text-sm font-bold text-foreground">System Prompt Instructions</h2>
-              <p className="mt-0.5 mb-2.5 text-xs text-muted-foreground">The master AI persona, objection handling scripts, and conversation flow.</p>
+              <h2 className="text-sm font-bold text-foreground">
+                {activeDirection === 'outbound' ? 'System Prompt Instructions' : 'Inbound System Prompt Instructions'}
+              </h2>
+              <p className="mt-0.5 mb-2.5 text-xs text-muted-foreground">
+                {activeDirection === 'outbound'
+                  ? 'The master AI persona, objection handling scripts, and conversation flow.'
+                  : 'How your agent handles an incoming call - what to listen for, how to answer, and when to offer a next step.'}
+              </p>
               <textarea
-                value={promptText}
-                onChange={(e) => setPromptText(e.target.value)}
+                value={activeDirection === 'outbound' ? promptText : inboundPromptText}
+                onChange={(e) => activeDirection === 'outbound' ? setPromptText(e.target.value) : setInboundPromptText(e.target.value)}
                 className="w-full h-[420px] resize-none rounded-lg border border-border bg-background p-4 text-sm font-mono outline-none focus:ring-2 focus:ring-primary leading-relaxed"
-                placeholder="Enter your system prompt here..."
+                placeholder={activeDirection === 'outbound' ? "Enter your system prompt here..." : "Enter your inbound call-handling prompt here..."}
               />
             </div>
           </div>
@@ -415,6 +558,15 @@ export default function PromptPage() {
           </div>
         </div>
       )}
+
+      {/* In-Browser LiveKit Voice Playground Modal */}
+      <LiveVoicePlayground
+        isOpen={showLiveVoicePlayground}
+        onClose={() => setShowLiveVoicePlayground(false)}
+        promptText={promptText}
+        welcomeMessage={welcomeMessage}
+        industry={selectedIndustry}
+      />
     </AppLayout>
   )
 }

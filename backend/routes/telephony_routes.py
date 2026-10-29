@@ -7,8 +7,8 @@ from auth import require_company_access
 
 telephony_router = APIRouter()
 
-DEFAULT_SHARED_NUMBER = os.environ.get("TALKLY_SHARED_NUMBER", "+918031830100")
-DEFAULT_SHARED_LABEL = "+91 80 3183 0100 (Talkly shared number)"
+DEFAULT_SHARED_NUMBER = os.environ.get("TALKLY_SHARED_NUMBER", "+918065535758")
+DEFAULT_SHARED_LABEL = os.environ.get("TALKLY_SHARED_LABEL", "+91 80 6553 5758 (Talkly Plivo shared number)")
 
 def mask_secret(val: str) -> str:
     if not val:
@@ -72,6 +72,16 @@ async def connect_telephony_line(payload: dict = Body(...), current_user: dict =
 
     db = mongodb.get_db()
     company_id = current_user["company_id"]
+
+    # Twilio/Exotel dispatch isn't implemented yet - only Plivo calls can
+    # actually be placed (see server.py's outbound trigger). Reject the
+    # connection here rather than silently saving credentials for a line
+    # that will never be able to place a call.
+    if provider in ("twilio", "exotel"):
+        raise HTTPException(
+            status_code=501,
+            detail=f"{provider.title()} isn't supported for live calls yet - only Plivo is currently wired up for outbound dispatch. Connect a Plivo number instead, or use the Talkly shared number."
+        )
 
     # Verify provider-specific required fields
     if provider == "twilio":

@@ -31,6 +31,67 @@ def _apply_header_style(ws, header_row=1):
 def _safe_row(row):
     return [str(item) if isinstance(item, (dict, list)) else item for item in row]
 
+def generate_calls_export(calls_data, direction_label="All"):
+    """Single-sheet, properly formatted .xlsx export of call records - used by
+    GET /api/v1/calls/export. Kept separate from generate_multi_sheet_report,
+    which is a real-estate-lead-pipeline report with a different shape."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"{direction_label.title()} Calls"[:31]  # Excel sheet name limit
+
+    headers = [
+        "Call ID", "Direction", "Customer Name", "Phone", "Language",
+        "Status", "Duration (mm:ss)", "Duration (sec)", "Sentiment",
+        "Lead Temperature", "Date", "Call Summary", "Transcript"
+    ]
+    ws.append(headers)
+
+    for c in calls_data:
+        duration_secs = c.get("duration_seconds")
+        if duration_secs is None:
+            duration_secs = 0
+        try:
+            duration_secs = float(duration_secs)
+        except (TypeError, ValueError):
+            duration_secs = 0
+        mins, secs = divmod(int(duration_secs), 60)
+        duration_fmt = f"{mins:02d}:{secs:02d}" if duration_secs > 0 else ""
+
+        analysis = c.get("analysis") or {}
+        dt = c.get("created_at")
+        dt_str = dt.strftime("%Y-%m-%d %H:%M:%S") if isinstance(dt, datetime) else str(dt or "")
+
+        ws.append(_safe_row([
+            c.get("call_id", ""),
+            c.get("direction", "outbound").title(),
+            c.get("customer_name", "") or "Unknown",
+            c.get("customer_id", "") or c.get("customer_phone", ""),
+            c.get("language", "English"),
+            c.get("status", ""),
+            duration_fmt,
+            int(duration_secs),
+            c.get("sentiment") or analysis.get("sentiment") or "",
+            analysis.get("lead_temperature", ""),
+            dt_str,
+            c.get("summary") or analysis.get("summary") or "",
+            c.get("transcript") or ""
+        ]))
+
+    _apply_header_style(ws)
+    ws.auto_filter.ref = ws.dimensions
+    ws.freeze_panes = "A2"
+    _auto_adjust_columns(ws)
+    # Transcript/summary columns can be very wide after auto-adjust - cap them.
+    ws.column_dimensions[get_column_letter(12)].width = 60
+    ws.column_dimensions[get_column_letter(13)].width = 80
+
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    wb.save(temp_file.name)
+    temp_file.close()
+
+    return temp_file.name
+
+
 def generate_multi_sheet_report(calls_data):
     wb = Workbook()
     
@@ -190,7 +251,7 @@ def generate_multi_sheet_report(calls_data):
     for c in calls_data:
         analysis = c.get("analysis") or {}
         reqs = analysis.get("property_requirements") or {}
-        objections = analysis.get("objections") or []
+        objections = analysis.get("key_objections") or []
         obj_str = ", ".join([o.get("content", "") for o in objections if isinstance(o, dict)]) if objections else "None"
         
         intents = analysis.get("intents") or []
@@ -270,7 +331,7 @@ def generate_multi_sheet_report(calls_data):
     for c in calls_data:
         analysis = c.get("analysis") or {}
         if analysis.get("lead_temperature") == "Cold":
-            objections = analysis.get("objections") or []
+            objections = analysis.get("key_objections") or []
             obj_str = ", ".join([o.get("content", "") for o in objections if isinstance(o, dict)]) if objections else "Unknown"
             
             budget_mismatch = "Yes" if "budget" in obj_str.lower() or "price" in obj_str.lower() else "No"

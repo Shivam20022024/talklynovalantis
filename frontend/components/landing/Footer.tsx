@@ -1,7 +1,16 @@
 'use client';
 
 import Image from 'next/image';
+import Link from 'next/link';
 import React from 'react';
+
+const LEGAL_LINKS = [
+  { name: 'Pricing', href: '/pricing' },
+  { name: 'Terms', href: '/terms' },
+  { name: 'Privacy', href: '/privacy' },
+  { name: 'Refund Policy', href: '/refund-policy' },
+  { name: 'Contact', href: '/contact' },
+];
 
 const SocialIcon = ({ children, href }: { children: React.ReactNode; href: string }) => (
   <a
@@ -72,8 +81,12 @@ export const Footer = () => {
             <p className="text-xs text-gray-400 dark:text-gray-500 font-medium">
               This product is made by Novalantis. All Rights Reserved.
             </p>
-            <div className="flex items-center gap-6 text-xs text-gray-400 dark:text-gray-500 font-medium">
-              {/* Privacy and terms links removed */}
+            <div className="flex flex-wrap items-center justify-center gap-5 text-xs text-gray-400 dark:text-gray-500 font-medium">
+              {LEGAL_LINKS.map((link) => (
+                <Link key={link.href} href={link.href} className="hover:text-theme-600 dark:hover:text-brand-primary transition-colors">
+                  {link.name}
+                </Link>
+              ))}
             </div>
           </div>
         </div>

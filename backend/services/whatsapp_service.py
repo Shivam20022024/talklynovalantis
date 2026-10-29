@@ -20,8 +20,8 @@ class WhatsAppService:
             digits = "91" + digits
         return digits
 
-    async def get_whatsapp_credentials(self, db, company_id: str) -> dict:
-        """Retrieves WhatsApp configuration for the company, falling back to environment variables."""
+    async def get_whatsapp_credentials(self, db, company_id: str = None) -> dict:
+        """Retrieves WhatsApp configuration dynamically from the company's database record."""
         config = {
             "enabled": True,
             "provider": "meta_cloud",
@@ -29,18 +29,25 @@ class WhatsAppService:
             "access_token": os.environ.get("WHATSAPP_ACCESS_TOKEN", "").strip()
         }
 
+        company = None
         if company_id:
             company = await db.companies.find_one({"company_id": company_id})
-            if company and company.get("whatsapp_config"):
-                w_cfg = company["whatsapp_config"]
-                if w_cfg.get("phone_number_id"):
-                    config["phone_number_id"] = w_cfg.get("phone_number_id").strip()
-                if w_cfg.get("access_token"):
-                    config["access_token"] = w_cfg.get("access_token").strip()
-                if "enabled" in w_cfg:
-                    config["enabled"] = bool(w_cfg["enabled"])
+        
+        # If no company found with that ID, find any company where user configured whatsapp in frontend
+        if not company or not company.get("whatsapp_config"):
+            company = await db.companies.find_one({"whatsapp_config.phone_number_id": {"$exists": True, "$ne": ""}})
+
+        if company and company.get("whatsapp_config"):
+            w_cfg = company["whatsapp_config"]
+            if w_cfg.get("phone_number_id"):
+                config["phone_number_id"] = w_cfg.get("phone_number_id").strip()
+            if w_cfg.get("access_token"):
+                config["access_token"] = w_cfg.get("access_token").strip()
+            if "enabled" in w_cfg:
+                config["enabled"] = bool(w_cfg["enabled"])
 
         return config
+
 
     async def send_meta_whatsapp_message(self, phone_number_id: str, access_token: str, recipient_phone: str, message_body: str) -> dict:
         """Calls the Meta WhatsApp Cloud API to send a text message."""
@@ -137,29 +144,36 @@ class WhatsAppService:
                 return
 
             company_id = call.get("company_id")
+            if not company_id:
+                lead = await db.leads.find_one({"lead_id": call_id})
+                if lead and lead.get("company_id"):
+                    company_id = lead.get("company_id")
+
             creds = await self.get_whatsapp_credentials(db, company_id)
 
             if not creds.get("enabled"):
                 return
 
             analysis = call.get("analysis") or {}
-            intents = analysis.get("intents") or []
-            summary = (analysis.get("summary") or "").lower()
-            action_items = [str(a).lower() for a in analysis.get("action_items") or []]
             reqs = analysis.get("requirements") or analysis.get("property_requirements") or {}
             timeline = reqs.get("timeline") or ""
 
-            # Check if WhatsApp was requested or appointment/demo confirmed
-            whatsapp_needed = (
-                any("whatsapp" in item for item in action_items)
-                or any("whatsapp" in s for s in [summary])
-                or "Follow-up Requested" in intents
-                or "Appointment Booking" in intents
-                or "Demo Booking" in intents
-                or any(k in summary for k in ["confirmed participation", "confirmed demo", "confirmed seat", "details via whatsapp"])
+            # Only message the customer when the call actually produced real
+            # signal of interest. Without this, a hallucinated/garbled "yes"
+            # on an otherwise low-quality call could still trigger an
+            # automatic "your seat is confirmed" WhatsApp to the customer -
+            # this reuses the same lead_status bar crm_service.py already
+            # computes from the full call analysis (not a single turn), plus
+            # an explicit AI-drafted WhatsApp recommendation as an override
+            # for calls where the AI specifically judged a message warranted.
+            lead_for_gate = await db.leads.find_one({"lead_id": call_id})
+            lead_status = (lead_for_gate or {}).get("status", "")
+            has_whatsapp_draft = any(
+                isinstance(rec, dict) and rec.get("type", "").lower() == "whatsapp" and rec.get("draft")
+                for rec in (analysis.get("follow_up_recommendations") or [])
             )
-
-            if not whatsapp_needed:
+            if lead_status not in ("Converted", "Qualified", "Interested") and not has_whatsapp_draft:
+                print(f"[WhatsApp Automation] Skipping {call_id}: no confirmed interest (lead_status='{lead_status}')")
                 return
 
             # Resolve customer phone
@@ -205,16 +219,20 @@ class WhatsAppService:
             access_token = creds.get("access_token")
 
             if phone_number_id and access_token:
+                # Dispatch custom personalized appointment & details message directly
                 result = await self.send_meta_whatsapp_message(
                     phone_number_id, access_token, customer_phone, draft_text
                 )
                 delivery_status = "sent" if result.get("status") == "success" else "failed"
                 message_id = result.get("message_id")
+
             else:
                 # Simulation mode (credentials not added yet)
                 delivery_status = "simulated"
                 message_id = f"sim_{int(datetime.datetime.utcnow().timestamp())}"
                 print(f"[WhatsApp Automation] Meta API credentials not set. Simulated sending to {customer_phone}:\n{draft_text}")
+
+
 
             now_iso = datetime.datetime.utcnow().isoformat() + "Z"
             whatsapp_record = {

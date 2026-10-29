@@ -1,0 +1,23 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env.local
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Must match the public URL nginx will expose the backend on
+        # (api.<yourdomain.com> below) - baked in at build time, see
+        # frontend/Dockerfile for why this can't just be a runtime env var.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend

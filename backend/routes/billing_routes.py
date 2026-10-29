@@ -5,6 +5,7 @@ import mongodb
 from auth import require_company_access as get_current_user
 from services.billing_service import billing_service
 from services.payment_provider import payment_provider
+from services.razorpay_provider import razorpay_provider
 
 billing_router = APIRouter()
 
@@ -15,9 +16,14 @@ class OrderRequest(BaseModel):
 class VerifyRequest(BaseModel):
     order_id: str
 
-class TopUpRequest(BaseModel):
+class RazorpayOrderRequest(BaseModel):
     amount: float
-    description: str = "Wallet Recharge"
+    currency: str = "INR"
+
+class RazorpayVerifyRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
 
 @billing_router.get("/wallet")
 async def get_wallet_dashboard(current_user: dict = Depends(get_current_user)):
@@ -84,21 +90,73 @@ async def get_usage(limit: int = 50, skip: int = 0, current_user: dict = Depends
 
     return usage
 
-@billing_router.post("/wallet/topup")
-async def direct_topup(req: TopUpRequest, current_user: dict = Depends(get_current_user)):
+@billing_router.post("/wallet/razorpay/create-order")
+async def create_razorpay_order(req: RazorpayOrderRequest, current_user: dict = Depends(get_current_user)):
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Recharge amount must be greater than 0")
-    import time
+    try:
+        order = razorpay_provider.create_order(
+            amount=req.amount,
+            currency=req.currency,
+            notes={"company_id": current_user["company_id"]}
+        )
+        return {"status": "success", "order": order}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create Razorpay order: {e}")
+
+@billing_router.post("/wallet/razorpay/verify-payment")
+async def verify_razorpay_payment(req: RazorpayVerifyRequest, current_user: dict = Depends(get_current_user)):
+    is_valid = razorpay_provider.verify_payment_signature(
+        req.razorpay_order_id, req.razorpay_payment_id, req.razorpay_signature
+    )
+    if not is_valid:
+        raise HTTPException(status_code=400, detail="Payment signature verification failed")
+
     db = mongodb.get_db()
+    order = razorpay_provider.client.order.fetch(req.razorpay_order_id)
+    amount = order.get("amount", 0) / 100.0
+
     tx = await billing_service.add_credits(
         db=db,
         company_id=current_user["company_id"],
-        amount=float(req.amount),
-        payment_provider="direct_topup",
-        provider_transaction_id=f"topup_{int(time.time()*1000)}",
-        description=req.description or f"Wallet top-up (₹{req.amount})"
+        amount=amount,
+        payment_provider="razorpay",
+        provider_transaction_id=req.razorpay_payment_id,
+        description=f"Wallet top-up via Razorpay (₹{amount})"
     )
-    return {"status": "success", "message": f"Successfully credited ₹{req.amount} to your wallet.", "transaction": tx}
+    return {"status": "success", "message": f"₹{amount} credited to your wallet.", "transaction": tx}
+
+@billing_router.post("/webhook/razorpay")
+async def razorpay_webhook(request: Request):
+    payload = await request.body()
+    signature = request.headers.get("x-razorpay-signature", "")
+
+    if not razorpay_provider.verify_webhook_signature(payload.decode('utf-8'), signature):
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    import json
+    data = json.loads(payload)
+
+    if data.get("event") == "payment.captured":
+        payment_entity = data.get("payload", {}).get("payment", {}).get("entity", {})
+        amount = payment_entity.get("amount", 0) / 100.0
+        payment_id = payment_entity.get("id")
+        company_id = payment_entity.get("notes", {}).get("company_id")
+
+        if company_id and payment_id:
+            db = mongodb.get_db()
+            await billing_service.add_credits(
+                db=db,
+                company_id=company_id,
+                amount=amount,
+                payment_provider="razorpay",
+                provider_transaction_id=payment_id,
+                description="Wallet top-up via Razorpay webhook"
+            )
+
+    return {"status": "ok"}
 
 @billing_router.post("/wallet/create-order")
 async def create_order(req: OrderRequest, current_user: dict = Depends(get_current_user)):

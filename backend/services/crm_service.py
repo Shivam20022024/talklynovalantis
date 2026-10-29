@@ -116,4 +116,87 @@ class CRMService:
             "response_text": resp.text[:200]
         }
 
+    async def sync_lead_status_from_call(self, db, lead_id: str, analysis_result: dict, company_id: str = None):
+        if not analysis_result:
+            return
+            
+        intents = analysis_result.get("intents") or []
+        summary = (analysis_result.get("summary") or "").lower()
+        conv_prob = analysis_result.get("conversion_probability") or 0
+        reqs = analysis_result.get("requirements") or analysis_result.get("property_requirements") or {}
+        timeline = reqs.get("timeline") if isinstance(reqs, dict) else None
+        lead_temp = analysis_result.get("lead_temperature")
+
+        conversion_intent_keywords = [
+            "Appointment Booking", "Demo Booking", "Site Visit", "Demo Scheduled", "Enrollment", "Converted",
+            "Doctor Consultation", "Consultation Confirmed", "Doctor Appointment", "Clinic Visit", "Slot Confirmed",
+            "Loan Application", "Documentation Callback", "Sanction Request", "Pre-Approval", "Sanction Ready",
+            "Executive Walkthrough", "Product Demo", "Meeting Scheduled", "Screen-share Demo"
+        ]
+        summary_conversion_keywords = [
+            "confirmed participation", "confirmed seat", "confirmed demo", "seat confirmed", "booked",
+            "appointment confirmed", "scheduled demo", "masterclass confirmed", "site visit confirmed",
+            "visit scheduled", "consultation confirmed", "sanction quote",
+            "document verification confirmed", "walkthrough confirmed", "screen-share confirmed", "demo booked"
+        ]
+
+        lead_score = analysis_result.get("lead_score", 0)
+        
+        is_callback_or_busy = (
+            bool(timeline and any(cb in str(timeline).lower() for cb in ["call back", "callback", "busy", "reschedule", "later", "not interested"]))
+            or any(cb in summary for cb in ["busy", "call back later", "callback later", "reschedule", "not a good time", "requested for a call back"])
+            or any(i in ["Low Intent Lead", "Not Interested", "Busy"] for i in intents)
+        )
+
+        is_converted = False
+        if not is_callback_or_busy and lead_temp != "Cold" and lead_score >= 50:
+            is_converted = (
+                any(i in conversion_intent_keywords for i in intents)
+                or conv_prob >= 70
+                or (any(k in summary for k in summary_conversion_keywords) and conv_prob >= 40)
+            )
+
+        if is_converted:
+            lead_status = "Converted"
+        elif lead_temp == "Hot" or conv_prob >= 50 or lead_score >= 75:
+            lead_status = "Qualified"
+        elif (lead_temp in ["Warm", "Hot"] or lead_score >= 40) and not (lead_temp == "Cold" and lead_score < 30):
+            lead_status = "Interested"
+        else:
+            lead_status = "Contacted"
+            
+        update_data = {
+            "status": lead_status,
+            "aiScore": analysis_result.get("lead_score", 0),
+            "lastContact": datetime.datetime.utcnow().isoformat()
+        }
+        
+        reqs = analysis_result.get("requirements") or analysis_result.get("property_requirements", {})
+        if isinstance(reqs, dict):
+            offering_val = reqs.get("offering") or reqs.get("propertyType") or reqs.get("property_type")
+            if offering_val:
+                update_data["property"] = offering_val
+                update_data["offering"] = offering_val
+            if reqs.get("location"):
+                update_data["location"] = reqs.get("location")
+            if reqs.get("budget"):
+                update_data["budget"] = reqs.get("budget")
+
+        await db.leads.update_one(
+            {"lead_id": lead_id},
+            {"$set": update_data}
+        )
+
+        # Push an in-app notification + email alert for anything worth a
+        # human knowing about right away. Without this, the only way to find
+        # out a lead went Qualified/Converted was to go open the Leads page.
+        if company_id and lead_status in ("Qualified", "Converted"):
+            try:
+                from services.notification_service import notification_service
+                lead_doc = await db.leads.find_one({"lead_id": lead_id})
+                await notification_service.notify_hot_lead(db, company_id, lead_id, lead_doc, lead_status, analysis_result)
+            except Exception as e:
+                print(f"Lead notification dispatch failed for {lead_id}: {e}")
+
 crm_service = CRMService()
+

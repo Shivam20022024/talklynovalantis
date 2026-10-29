@@ -12,7 +12,6 @@ from auth import (
     ROLE_SUPER_ADMIN,
     require_company_access,
 )
-from services.billing_service import billing_service
 from industry_templates import INDUSTRY_TEMPLATES
 
 auth_router = APIRouter()
@@ -106,13 +105,9 @@ async def register_company(payload: dict = Body(...)):
             "updated_at": now
         })
 
-    # Automatically grant ₹100 Free Trial starter wallet credits (~10 free call minutes)
-    try:
-        await billing_service.add_credits(
-            db, company_id, 100.0, "TRIAL_GRANT", f"trial_{company_id}", "Free Trial Starter Credits (10 Free Minutes)"
-        )
-    except Exception as ex:
-        print(f"Warning: Failed to grant trial credits: {ex}")
+    # No cash grant on signup: new companies get TRIAL_FREE_SECONDS (10 min)
+    # of genuinely free calling, metered directly in process_call_billing()
+    # and check_call_allowance() rather than approximated as a rupee credit.
 
     access_token = create_access_token(data={"sub": user_id, "email": email})
     return {

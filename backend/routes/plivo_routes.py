@@ -1,0 +1,1163 @@
+# In-memory call cache for ultra-low latency WebSocket greeting
+PLIVO_CALL_CACHE = {}
+# Pre-warmed OpenAI Realtime sessions, keyed by call_id. Populated by
+# prewarm_openai_session() as soon as /answer fires (call picked up), so the
+# /stream handler (which connects moments later) can skip the connect +
+# session.update round trip instead of paying that cost after the customer
+# is already live on the line.
+OPENAI_PREWARM_CACHE = {}
+from fastapi import APIRouter, Request, Response, WebSocket, WebSocketDisconnect, HTTPException, Depends, Query, Body
+from fastapi.concurrency import run_in_threadpool
+from datetime import datetime
+import os
+import sys
+import time
+import json
+import base64
+import audioop
+import asyncio
+import logging
+import websockets
+import mongodb
+from auth import require_company_access
+from telephony.plivo_provider import PlivoProvider
+from process_audio import analyze_transcript_text
+from services.crm_service import crm_service
+from services.billing_service import billing_service
+from industry_templates import INDUSTRY_TEMPLATES
+import requests
+import sys
+from dotenv import load_dotenv
+
+try:
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
+def safe_print(*args, **kwargs):
+    text = " ".join(str(a) for a in args)
+    try:
+        print(*args, **kwargs)
+    except Exception:
+        try:
+            cleaned = [str(a).encode('ascii', errors='replace').decode('ascii') for a in args]
+            print(*cleaned, **kwargs)
+        except Exception:
+            pass
+    try:
+        log_path = os.path.join(BASE_DIR, "plivo_call.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.utcnow().isoformat()}] {text}\n")
+    except Exception:
+        pass
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(BASE_DIR, ".env.local"))
+
+logger = logging.getLogger("talkly-plivo-streaming")
+plivo_router = APIRouter()
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+
+# Known Whisper "silence hallucination" phrases - fabricated, fluent-sounding
+# text the model emits when fed near-silent/low-energy audio instead of real
+# speech. Shared by both customer-speech event handlers so the list can't drift.
+HALLUCINATION_PHRASES = {
+    "ha-ha.", "ha-ha", "...", "[music]", "[applause]", "empecemos.", "empecemos",
+    "nighty, yeah, thank you", "thanks for watching!", "thanks for watching.",
+    "thanks for watching", "thank you for watching.", "thank you for watching!",
+    "bye-bye, everyone.", "bye-bye, everyone", "see you on monday.", "see you on monday",
+    "how about that, yeah?", "how about that, yeah", "now what are you you",
+    "thank you. bye bye.", "thank you, bye bye.", "thank you bye bye", "bye.", "you.",
+    "i love you all.", "i love you all", "god bless you all.", "god bless you all",
+    "god bless you.", "god bless you", "like and subscribe", "please subscribe",
+    "subscribe to my channel", "don't forget to subscribe", "i want to give it a like.",
+    "i want to give it a like",
+}
+
+# Below this RMS (16-bit linear PCM decoded from 8kHz mu-law telephony audio), a
+# VAD-flagged "speech" segment is almost certainly silence or background noise,
+# not real speech - Whisper still returns a fluent-sounding transcript for it
+# regardless, so gate on measured energy instead of trusting the transcript.
+# Starting point only; tune against the [AUDIO ENERGY] values logged per turn.
+SILENCE_RMS_THRESHOLD = 150
+
+
+async def finalize_plivo_call(
+    call_id: str,
+    company_id: str = None,
+    duration: int = None,
+    hangup_cause: str = None,
+    transcript_parts: list = None
+):
+    """
+    Finalizes a completed Plivo call:
+    1. Saves transcript and duration to db.calls.
+    2. Runs AI sentiment & conversion analysis on transcript.
+    3. Updates db.leads status from 'Calling' to 'Contacted', 'Interested', 'Qualified', or 'Converted'.
+    """
+    if not call_id:
+        return
+
+    db = mongodb.get_db()
+    call_doc = await db.calls.find_one({"call_id": call_id})
+    if not call_doc:
+        logger.warning(f"finalize_plivo_call: call_id {call_id} not found")
+        return
+
+    cid = company_id or call_doc.get("company_id")
+
+    # The /stream websocket's finally-block and the /hangup webhook both call
+    # this function for outbound calls (inbound only ever gets the first, since
+    # there's no per-call hangup_url for Plivo to hit - see below). Whichever
+    # one finishes the analysis/CRM/WhatsApp pipeline writes "status": "Analyzed"
+    # together with the transcript and analysis result in a single update at
+    # the very end of this function, so seeing that status here means a prior
+    # call for this call_id already ran that pipeline in full - skip it again
+    # below to avoid duplicate GPT-4o analysis, CRM webhook deliveries, and
+    # WhatsApp dispatch. Duration/billing still run unconditionally below since
+    # they already have their own idempotency handling.
+    already_analyzed = call_doc.get("status") == "Analyzed"
+
+    # Plivo's /hangup webhook only ever gets wired up for outbound calls -
+    # trigger_outbound_call() can embed call_id/company_id into a per-call
+    # hangup_url because Talkly places those calls itself. For inbound calls
+    # Plivo initiates the call, so there's no per-call hangup_url to set, and
+    # /hangup never fires - confirmed live, every inbound call's duration,
+    # duration_seconds and hangup_cause stayed null despite a full transcript
+    # existing. Rather than depend on that webhook, derive duration from our
+    # own answered_at/created_at timestamp whenever Plivo didn't give us one -
+    # this path (the /stream websocket's finally-block) fires for every call,
+    # inbound or outbound, the moment the media stream actually disconnects.
+    if duration is None:
+        started_at = None
+        for field in ("answered_at", "created_at"):
+            raw = call_doc.get(field)
+            if not raw:
+                continue
+            try:
+                started_at = datetime.fromisoformat(raw) if isinstance(raw, str) else raw
+                break
+            except Exception:
+                continue
+        if started_at:
+            duration = max(0, int((datetime.utcnow() - started_at).total_seconds()))
+
+    update_data = {
+        "status": "Completed",
+        "last_updated": datetime.utcnow().isoformat()
+    }
+    if duration is not None:
+        update_data["duration"] = duration
+        update_data["duration_seconds"] = duration
+    if hangup_cause:
+        update_data["hangup_cause"] = hangup_cause
+        update_data["ended_at"] = datetime.utcnow().isoformat()
+
+    # Meter the call for billing. process_call_billing() has its own
+    # call_id idempotency check against db.usage_records, so it's safe for
+    # this to run from both this path (estimated duration) and from
+    # /hangup (Plivo's authoritative duration, when it does fire) - whichever
+    # runs first bills the call, the second is a no-op.
+    if duration is not None and cid:
+        try:
+            direction = call_doc.get("direction", "outbound")
+            await billing_service.process_call_billing(db, call_id, cid, direction, float(duration), provider="plivo")
+        except Exception as e:
+            logger.error(f"Billing failed for Plivo call {call_id}: {e}")
+
+    full_transcript = None
+    if transcript_parts:
+        full_transcript = "\n".join(transcript_parts).strip()
+        update_data["transcript"] = full_transcript
+    elif call_doc.get("transcript"):
+        full_transcript = call_doc["transcript"].strip()
+
+    # If transcript exists, perform AI intelligence analysis
+    analysis_result = None
+    if already_analyzed:
+        logger.info(f"finalize_plivo_call: call {call_id} already analyzed by a prior call, skipping duplicate analysis/CRM/WhatsApp dispatch.")
+    elif full_transcript and len(full_transcript) > 10:
+        try:
+            logger.info(f"Running AI analysis for Plivo call {call_id}...")
+            analysis_result = await run_in_threadpool(analyze_transcript_text, full_transcript)
+            if analysis_result:
+                detected = analysis_result.get("detected_language") or analysis_result.get("language_detected") or "English"
+                update_data.update({
+                    "status": "Analyzed",
+                    "summary": analysis_result.get("summary"),
+                    "sentiment": analysis_result.get("sentiment"),
+                    "language": detected,
+                    "analysis": analysis_result
+                })
+                # Sync lead status (Qualified, Interested, Converted, etc.)
+                await crm_service.sync_lead_status_from_call(db, call_id, analysis_result, company_id=cid)
+                # Dispatch CRM webhook if configured
+                asyncio.create_task(crm_service.sync_call_to_crm(db, call_id))
+                # Trigger automated WhatsApp follow-up if customer asked or meeting booked
+                from services.whatsapp_service import whatsapp_service
+                asyncio.create_task(whatsapp_service.process_post_call_whatsapp(db, call_id))
+        except Exception as e:
+            logger.error(f"Analysis failed for Plivo call {call_id}: {e}")
+
+    # If no AI analysis (e.g. short call), ensure db.leads is updated from 'Calling' to 'Contacted' or 'No Answer'
+    if not analysis_result and not already_analyzed:
+        dur = duration if duration is not None else int(call_doc.get("duration", 0) or 0)
+        lead_status = "Contacted" if dur > 0 else "No Answer"
+        await db.leads.update_one(
+            {"lead_id": call_id},
+            {"$set": {
+                "status": lead_status,
+                "lastContact": datetime.utcnow().isoformat()
+            }}
+        )
+
+    await db.calls.update_one({"call_id": call_id}, {"$set": update_data})
+    logger.info(f"Plivo call {call_id} finalized successfully.")
+
+
+async def resolve_call_voice_context(db, call_id: str, company_id: str = None) -> dict:
+    """Resolve the system prompt, opening greeting, transcription language, and
+    company doc for a call. Shared by the /answer pre-warm path and the
+    /stream cold-start fallback so the two can never drift out of sync."""
+    call_doc_task = db.calls.find_one({"call_id": call_id}) if call_id else None
+    comp_doc_task = db.companies.find_one({"company_id": company_id}) if company_id else None
+    lead_doc_task = db.leads.find_one({"lead_id": call_id, "company_id": company_id}) if (call_id and company_id) else None
+    prompt_doc_task = db.prompts.find_one({"company_id": company_id}) if company_id else None
+
+    call_doc, company, lead_doc, prompt_doc = await asyncio.gather(
+        call_doc_task or asyncio.sleep(0),
+        comp_doc_task or asyncio.sleep(0),
+        lead_doc_task or asyncio.sleep(0),
+        prompt_doc_task or asyncio.sleep(0)
+    )
+
+    if not isinstance(call_doc, dict):
+        call_doc = None
+    if not isinstance(company, dict):
+        company = None
+    if not isinstance(lead_doc, dict):
+        lead_doc = None
+    if not isinstance(prompt_doc, dict):
+        prompt_doc = None
+
+    if call_doc and call_doc.get("company_id") and not company_id:
+        company_id = call_doc["company_id"]
+        if not company:
+            company = await db.companies.find_one({"company_id": company_id})
+        if not prompt_doc:
+            prompt_doc = await db.prompts.find_one({"company_id": company_id})
+
+    company_name = (company.get("name") if company else "") or "Talkly"
+
+    customer_name = ""
+    if call_doc and call_doc.get("customer_name"):
+        cname = str(call_doc.get("customer_name")).strip()
+        if cname.lower() not in ("valued customer", "unknown", "there", ""):
+            customer_name = cname
+
+    if not lead_doc and call_doc and call_doc.get("customer_id") and company_id:
+        lead_doc = await db.leads.find_one({"phone": call_doc.get("customer_id"), "company_id": company_id})
+
+    if not customer_name and lead_doc and lead_doc.get("name"):
+        cname = str(lead_doc.get("name")).strip()
+        if cname.lower() not in ("valued customer", "unknown", "there", ""):
+            customer_name = cname
+
+    call_industry = None
+    if prompt_doc and prompt_doc.get("industry"):
+        call_industry = prompt_doc.get("industry")
+    elif company and company.get("industry"):
+        call_industry = company.get("industry")
+    elif call_doc and call_doc.get("industry") and call_doc.get("industry") != "general_sales":
+        call_industry = call_doc.get("industry")
+    elif lead_doc and lead_doc.get("industry") and lead_doc.get("industry") != "general_sales":
+        call_industry = lead_doc.get("industry")
+    elif call_doc and call_doc.get("industry"):
+        call_industry = call_doc.get("industry")
+
+    if not call_industry or call_industry not in INDUSTRY_TEMPLATES:
+        call_industry = "general_sales"
+
+    is_inbound = bool(call_doc and call_doc.get("direction") == "inbound")
+
+    offering = ""
+    if lead_doc:
+        offering = str(lead_doc.get("offering") or lead_doc.get("property") or "").strip()
+    if not offering:
+        industry_fallbacks = {
+            "real_estate": "luxury property",
+            "healthcare": "doctor appointment consultation",
+            "edtech": "online certification program",
+            "bfsi": "loan options",
+            "general_sales": "AI calling services"
+        }
+        offering = industry_fallbacks.get(call_industry, "AI calling services")
+
+    location = ""
+    if lead_doc:
+        location = str(lead_doc.get("location") or "").strip()
+    if not location:
+        location = "our office"
+
+    template_def = INDUSTRY_TEMPLATES.get(call_industry, INDUSTRY_TEMPLATES["general_sales"])
+
+    system_prompt = None
+    welcome_text = None
+
+    if prompt_doc:
+        if is_inbound:
+            cand_prompt = prompt_doc.get("published_inbound_prompt") or prompt_doc.get("inbound_prompt")
+            cand_welcome = prompt_doc.get("published_inbound_welcome_message") or prompt_doc.get("inbound_welcome_message")
+            is_stale_real_estate = False
+        else:
+            cand_prompt = prompt_doc.get("published_prompt") or prompt_doc.get("prompt")
+            cand_welcome = prompt_doc.get("published_welcome_message") or prompt_doc.get("welcome_message")
+            is_stale_real_estate = (
+                call_industry != "real_estate" and cand_welcome and
+                ("फ्लैट" in cand_welcome or "nov" in cand_welcome or "प्रोजेक्ट" in cand_welcome or "फ्लैट लेने का" in cand_welcome)
+            )
+        if cand_prompt and not is_stale_real_estate:
+            system_prompt = cand_prompt
+        if cand_welcome and not is_stale_real_estate:
+            welcome_text = cand_welcome
+
+    if not system_prompt:
+        system_prompt = template_def["inbound_prompt"] if is_inbound else template_def["prompt"]
+    if not welcome_text:
+        welcome_text = template_def["inbound_welcome_message"] if is_inbound else template_def["welcome_message"]
+
+    name_tags = ["{{customer_name}}", "{customer_name}", "{{lead_name}}", "{lead_name}", "{{name}}", "{name}", "{{lead}}", "{lead}"]
+    if customer_name:
+        for tag in name_tags:
+            welcome_text = welcome_text.replace(tag, customer_name)
+            system_prompt = system_prompt.replace(tag, customer_name)
+    else:
+        for tag in name_tags:
+            welcome_text = welcome_text.replace(f"{tag},", "").replace(tag, "").replace("  ", " ").strip()
+            system_prompt = system_prompt.replace(tag, "the customer")
+
+    company_tags = ["{{company_name}}", "{company_name}", "{{company}}", "{company}"]
+    for tag in company_tags:
+        welcome_text = welcome_text.replace(tag, company_name)
+        system_prompt = system_prompt.replace(tag, company_name)
+
+    offering_tags = ["{{offering}}", "{offering}", "{{property_name}}", "{property_name}", "{{service}}", "{service}"]
+    for tag in offering_tags:
+        welcome_text = welcome_text.replace(tag, offering)
+        system_prompt = system_prompt.replace(tag, offering)
+
+    location_tags = ["{{property_location}}", "{property_location}", "{{location}}", "{location}"]
+    for tag in location_tags:
+        welcome_text = welcome_text.replace(tag, location)
+        system_prompt = system_prompt.replace(tag, location)
+
+    indian_accent_directive = (
+        "CRITICAL VOICE & ACCENT DIRECTIVE:\n"
+        "- IDENTITY: You are an Indian professional voice representative calling from an office in India.\n"
+        "- ACCENT: Speak with an authentic, natural urban Indian English accent (Indian English cadence, syllable-timing, and clear intonation).\n"
+        "- PHONETICS: Use distinct Indian English articulation (crisp dental 't' and 'd' stops, clear vowels, NO American rhotic 'r' drawl, NO American slang or valley-girl inflection).\n"
+        "- PROHIBITED: NEVER speak in an American, British, or foreign Western accent. Avoid American filler sounds like 'gonna', 'wanna', 'kinda'.\n"
+        "- LANGUAGE MIRRORING: Always match the language the customer is actually using, turn by turn - do not stay locked to your opening greeting's language. If they reply in English, continue in English (with your Indian English accent). If they speak Hindi or code-mixed Hinglish, respond in natural Hindi/Hinglish. If they explicitly ask for Hindi ('हिंदी में बात करो') or ask for English, switch immediately. If the customer has replied in English for the last two turns, keep speaking English even if your earlier turns were in Hindi.\n\n"
+    )
+
+    conversation_rules = (
+        "\n\nCRITICAL CONVERSATIONAL & REJECTION RULES:"
+        "\n1. ACCENT: Maintain your authentic, polite Indian English accent consistently across every single turn. Do not drift into an American accent."
+        "\n2. HANDLE REJECTION & HESITATION IMMEDIATELY: This covers two kinds of signal, both handled the same way - DO NOT continue pushing your sales pitch or asking for budget/configuration:"
+        "\n   a) Explicit rejection: 'Bye', 'Nahi chahiye', 'Not interested', 'No', 'Busy hoon', 'Call mat karo', 'Wrong number', or clearly wanting to hang up."
+        "\n   b) Soft hesitation or wanting to end, even without an explicit 'no': phrases like 'I'm afraid...', 'I think that's all for today', 'maybe some other time', 'not right now', 'let me think about it', or any answer that signals discomfort, reluctance, or a wish to wrap up rather than continue. Do not require an exact phrase match - judge the customer's intent, not just their words."
+        "\n   In either case, immediately say a warm goodbye in whichever language the customer has been using (Hindi: 'बहुत-बहुत धन्यवाद, आपका दिन शुभ हो! अलविदा।' / English: 'Thank you so much, have a great day! Goodbye.') and execute the end_call function."
+        "\n3. OFF-TOPIC BUT UNDERSTANDABLE QUESTIONS ARE NOT REJECTION: If the customer asks something clearly understandable but unrelated to your pitch (e.g. 'what time is it?', small talk, a random question), this is NOT hesitation and NOT a cue to say goodbye or end the call - rule 2 does not apply here. Briefly and politely acknowledge or answer in one short sentence (e.g. say you don't have that info if asked something you can't answer), then gently continue toward your next objective. Only rule 2 (explicit or soft rejection) or rule 7 (genuinely unclear/garbled input) are valid reasons to say goodbye or ask them to repeat - an off-topic-but-sensible remark is neither."
+        "\n4. STRICT STAGE PROGRESSION: Only when the customer is responsive and interested, guide them through the Key Objectives in sequential order:"
+        "\n   - Step 1: Deliver your opening greeting and wait for their response."
+        "\n   - Step 2: Ask question 2 from your objectives (e.g. Qualification: ask configuration / requirements)."
+        "\n   - Step 3: Present value pitch and ask for budget / timeline."
+        "\n   - Step 4: Propose the call to action (e.g. site visit or demo)."
+        "\n   - Step 5: Once agreed or concluded, say a warm goodbye in whichever language the customer has been using (Hindi: 'बहुत-बहुत धन्यवाद, आपका दिन शुभ हो! अलविदा।' / English: 'Thank you so much, have a great day! Goodbye.'), and execute the end_call function."
+        "\n5. ONE QUESTION PER TURN: Ask strictly ONE question per turn. Never speak two questions back-to-back. Never answer your own questions."
+        "\n6. AUTOMATIC HANGUP: Immediately after concluding your goodbye, invoke the end_call function."
+        "\n7. HANDLE UNCLEAR INPUT: If what the customer said does not logically fit the conversation, sounds garbled, or like background noise rather than a real answer, DO NOT guess or respond as if you understood it. This includes a random name, place, or short phrase with no logical connection to the question you just asked (e.g. you asked for a day/time and the answer is an unrelated proper noun) - NEVER interpret that as agreement, enthusiasm, or a valid choice. Politely ask them to repeat instead - Hindi: 'माफ कीजिए, क्या आप फिर से बता सकते हैं?' / English: 'Sorry, could you repeat that?' Only move forward once you get a clear, relevant answer to your last question. (Note: a coherent but off-topic remark is covered by rule 3, not this rule.)"
+    )
+    system_prompt = indian_accent_directive + system_prompt + conversation_rules
+
+    safe_print(f"[STREAM PROMPT]: Industry={call_industry}, Welcome='{welcome_text}'")
+
+    call_lang = (call_doc.get("language") if call_doc else None) or (lead_doc.get("language") if lead_doc else None) or "Hinglish"
+    # Whisper's `language` hint forces transcription into that language - a
+    # wrong code actively hurts accuracy rather than helping (e.g. locking a
+    # Tamil or pure-English caller into Hindi). Only pass a code for languages
+    # Whisper actually supports well. "Hinglish" is pinned to "hi" rather than
+    # left to auto-detect: tested live on 2026-10-27, omitting the language
+    # for Hinglish calls let the model mis-detect Hindi speech as Urdu and
+    # transcribe it in Arabic script - technically a distinct language, but
+    # unreadable and useless for a team that works in Hindi/English. Devanagari
+    # output with some imperfectly-folded-in English is far more usable than
+    # accurate-but-unreadable Urdu script. True auto-detect is kept only for
+    # languages with no mapping at all (an unexpected value, not the common
+    # default path).
+    WHISPER_LANGUAGE_CODES = {
+        "english": "en", "hindi": "hi", "hinglish": "hi", "tamil": "ta",
+        "telugu": "te", "kannada": "kn", "malayalam": "ml", "bengali": "bn",
+        "marathi": "mr", "gujarati": "gu", "punjabi": "pa", "urdu": "ur",
+    }
+    transcription_lang = WHISPER_LANGUAGE_CODES.get(str(call_lang).strip().lower())
+
+    return {
+        "system_prompt": system_prompt,
+        "welcome_text": welcome_text,
+        "transcription_lang": transcription_lang,
+        "company": company,
+    }
+
+
+def _openai_session_update_payload(system_prompt: str, transcription_lang: str = None) -> dict:
+    # Reverted from gpt-4o-mini-transcribe back to whisper-1 (2026-10-27):
+    # gpt-4o-mini-transcribe has a well-documented community-reported bug
+    # where it ignores the `language` hint entirely - confirmed live here too,
+    # a single Hindi/Hinglish call came back transcribed in Hindi, Urdu, Thai,
+    # and Bengali script in the same conversation despite "hi" being pinned.
+    # whisper-1 reliably honors `language` as a hard constraint, which is what
+    # we actually need given Hinglish is pinned to "hi" below.
+    transcription_config = {"model": "whisper-1"}
+    if transcription_lang:
+        # Only pin a language when we have a reliable code for it - see
+        # resolve_call_voice_context.
+        transcription_config["language"] = transcription_lang
+
+    return {
+        "type": "session.update",
+        "session": {
+            "type": "realtime",
+            "instructions": system_prompt,
+            "audio": {
+                "input": {
+                    "format": {"type": "audio/pcmu"},
+                    "transcription": transcription_config,
+                    # Suppresses background/ambient noise before it reaches the
+                    # transcriber and the turn-detector - "near_field" fits a
+                    # phone call (mic close to the speaker's mouth), unlike
+                    # "far_field" which targets laptop/conference-room mics.
+                    # Confirmed via OpenAI's official SDK reference docs. Watch
+                    # for added turn-taking latency on the next test call - one
+                    # community report flagged this as a real tradeoff.
+                    "noise_reduction": {"type": "near_field"},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.65,
+                        # Wider than before on purpose: short/fragmented audio
+                        # clips are what push Whisper into hallucinating fluent
+                        # but unrelated text instead of transcribing accurately.
+                        # More lead-in and more silence before cutting a turn
+                        # gives it fuller, less ambiguous utterances to work with.
+                        "prefix_padding_ms": 500,
+                        "silence_duration_ms": 1000,
+                        "create_response": True,
+                        "interrupt_response": True
+                    }
+                },
+                "output": {
+                    "format": {"type": "audio/pcmu"},
+                    "voice": "coral",
+                    "speed": 1.0
+                }
+            },
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "end_call",
+                    "description": "Hang up and terminate the call immediately when the conversation is finished, after the appointment or inquiry has been confirmed and you have said a polite goodbye.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "reason": {
+                                "type": "string",
+                                "description": "Reason for ending the call (e.g. appointment_confirmed, customer_ended)"
+                            }
+                        },
+                        "required": ["reason"]
+                    }
+                }
+            ],
+            "tool_choice": "auto"
+        }
+    }
+
+
+async def prewarm_openai_session(call_id: str, company_id: str = None):
+    """Open and configure the OpenAI Realtime session the moment the call is
+    answered - before Plivo's bidirectional media stream even connects - so
+    /stream can reuse an already-warm, already-configured connection instead
+    of paying the connect + session.update round trip after the customer is
+    already live on the line. On any failure this simply does not populate
+    the cache; /stream's existing cold-path logic runs exactly as before.
+    """
+    if not call_id:
+        return
+    try:
+        db = mongodb.get_db()
+        ctx = await resolve_call_voice_context(db, call_id, company_id)
+
+        openai_key = os.environ.get("OPENAI_API_KEY", "").strip() or OPENAI_API_KEY
+        if not openai_key:
+            return
+        openai_ws_url = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
+        openai_headers = {"Authorization": f"Bearer {openai_key}"}
+
+        ws_cm = websockets.connect(openai_ws_url, additional_headers=openai_headers)
+        openai_ws = await asyncio.wait_for(ws_cm.__aenter__(), timeout=8.0)
+        await asyncio.wait_for(openai_ws.recv(), timeout=8.0)  # session.created
+
+        session_update = _openai_session_update_payload(ctx["system_prompt"], ctx["transcription_lang"])
+        await openai_ws.send(json.dumps(session_update))
+
+        OPENAI_PREWARM_CACHE[call_id] = {
+            "ws_cm": ws_cm,
+            "openai_ws": openai_ws,
+            "system_prompt": ctx["system_prompt"],
+            "welcome_text": ctx["welcome_text"],
+            "company": ctx["company"],
+        }
+        safe_print(f"[PREWARM]: OpenAI Realtime session ready ahead of stream connect for call_id={call_id}")
+
+        async def _expire():
+            await asyncio.sleep(25.0)
+            entry = OPENAI_PREWARM_CACHE.pop(call_id, None)
+            if entry:
+                try:
+                    await entry["ws_cm"].__aexit__(None, None, None)
+                except Exception:
+                    pass
+                safe_print(f"[PREWARM]: Expired unclaimed session for call_id={call_id}")
+        asyncio.create_task(_expire())
+
+    except Exception as e:
+        safe_print(f"[PREWARM ERROR]: Could not pre-warm OpenAI session for call_id={call_id}: {e}")
+
+
+@plivo_router.api_route("/answer", methods=["GET", "POST"])
+async def plivo_answer_call(request: Request, call_id: str = Query(None), company_id: str = Query(None)):
+    """
+    Called by Plivo when an outbound or inbound call is answered.
+    Returns Plivo XML directing Plivo to stream real-time audio over WebSocket.
+    """
+    if request.method == "POST":
+        try:
+            form_data = await request.form()
+            data = dict(form_data)
+        except Exception:
+            data = dict(request.query_params)
+    else:
+        data = dict(request.query_params)
+
+    call_uuid = data.get("CallUUID")
+    dialed_to = data.get("To", "")
+    caller_from = data.get("From", "")
+    direction = data.get("Direction", "outbound")
+    logger.info(f"Plivo Call Answered: call_id={call_id}, call_uuid={call_uuid}, direction={direction}, from={caller_from}, to={dialed_to}")
+
+    db = mongodb.get_db()
+
+    # Handle Inbound Calls (Customer calling our Plivo number directly)
+    if not call_id:
+        import time
+        call_id = f"inbound-{int(time.time() * 1000)}"
+        clean_to = dialed_to if str(dialed_to).startswith("+") else f"+{dialed_to}"
+        clean_from = caller_from if str(caller_from).startswith("+") else f"+{caller_from}"
+
+        # Resolve which company owns this number
+        if not company_id:
+            num_doc = await db.phone_numbers.find_one({"phone_number": clean_to})
+            if num_doc and num_doc.get("company_id"):
+                company_id = num_doc["company_id"]
+            if not company_id:
+                comp = await db.companies.find_one({"telephony.phone_number": clean_to})
+                if comp and comp.get("company_id"):
+                    company_id = comp["company_id"]
+            if not company_id:
+                # Default active tenant
+                company_id = "209cb85e-5ce7-449e-b32c-ad5ca4c6c635"
+
+        # Block the AI agent from picking up if this company is out of free
+        # trial minutes and has no wallet balance - still answer the call
+        # (so the caller doesn't just hear ringing-into-nothing) but tell
+        # them the line can't take the call right now instead of silently
+        # running up a bill nobody can pay.
+        allowance = await billing_service.check_call_allowance(db, company_id)
+        if not allowance["allowed"]:
+            logger.warning(f"Inbound call to company {company_id} blocked - {allowance['reason']}")
+            busy_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Speak>This number is temporarily unable to take calls. Please try again later.</Speak>
+    <Hangup/>
+</Response>"""
+            return Response(content=busy_xml.encode("utf-8"), media_type="text/xml; charset=utf-8")
+
+        # Check if caller matches an existing lead
+        caller_name = "Inbound Caller"
+        digits = "".join(filter(str.isdigit, clean_from))
+        if len(digits) >= 10:
+            last10 = digits[-10:]
+            lead_match = await db.leads.find_one({"phone": {"$regex": last10}, "company_id": company_id})
+            if lead_match and lead_match.get("name"):
+                caller_name = lead_match["name"].strip()
+
+        comp_doc = await db.companies.find_one({"company_id": company_id})
+        comp_ind = (comp_doc.get("industry") if comp_doc else None) or "general_sales"
+
+        await db.calls.insert_one({
+            "call_id": call_id,
+            "company_id": company_id,
+            "customer_id": clean_from,
+            "customer_name": caller_name,
+            "direction": "inbound",
+            "status": "In Progress",
+            "plivo_call_uuid": call_uuid,
+            "created_at": datetime.utcnow(),
+            "answered_at": datetime.utcnow().isoformat(),
+            "industry": comp_ind
+        })
+        logger.info(f"Registered incoming call: call_id={call_id}, caller={clean_from}, company_id={company_id}")
+    else:
+        await db.calls.update_one(
+            {"call_id": call_id},
+            {"$set": {
+                "status": "In Progress",
+                "plivo_call_uuid": call_uuid,
+                "answered_at": datetime.utcnow().isoformat()
+            }}
+        )
+
+    base_url = os.environ.get("BASE_URL", "http://localhost:8002").rstrip("/")
+    # Convert http/https to ws/wss for WebSocket URL
+    ws_base = base_url.replace("https://", "wss://").replace("http://", "ws://")
+    # Cache metadata for 0ms lookup in WebSocket stream
+    PLIVO_CALL_CACHE[call_id] = {
+        "company_id": company_id,
+        "call_id": call_id,
+        "direction": direction,
+        "customer_name": caller_name if not call_id or "inbound" in str(call_id) else (lead_match.get("name") if 'lead_match' in locals() and lead_match else None)
+    }
+
+    # Kick off the OpenAI Realtime connect + session config now, in parallel
+    # with Plivo setting up the bidirectional media stream, instead of after
+    # /stream connects. See prewarm_openai_session() for details.
+    asyncio.create_task(prewarm_openai_session(call_id, company_id))
+
+    stream_url = f"{ws_base}/api/v1/plivo/stream?call_id={call_id}&amp;company_id={company_id}"
+
+    # Return Plivo Bidirectional Audio Stream XML
+    xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">
+        {stream_url}
+    </Stream>
+</Response>"""
+
+    return Response(content=xml_content.encode("utf-8"), media_type="text/xml; charset=utf-8")
+
+
+@plivo_router.websocket("/stream")
+async def plivo_realtime_audio_stream(websocket: WebSocket, call_id: str = Query(None), company_id: str = Query(None)):
+    """
+    High-performance bidirectional audio stream between Plivo and OpenAI Realtime API.
+    Provides sub-400ms latency, lifelike human voice, and instant barge-in interruption.
+    """
+    await websocket.accept()
+    logger.info(f"Plivo Media Stream connected for call_id={call_id}")
+    db = mongodb.get_db()
+
+    # Reuse a pre-warmed OpenAI Realtime session if /answer already started one
+    # for this call (see prewarm_openai_session). Falls back to resolving
+    # everything cold, exactly as before, if none is available/usable.
+    prewarmed = OPENAI_PREWARM_CACHE.pop(call_id, None) if call_id else None
+    prewarmed_usable = bool(prewarmed and getattr(prewarmed.get("openai_ws"), "close_code", None) is None)
+
+    if prewarmed_usable:
+        system_prompt = prewarmed["system_prompt"]
+        welcome_text = prewarmed["welcome_text"]
+        company = prewarmed["company"]
+        transcription_lang = None  # unused on the reuse path - session is already configured
+        safe_print(f"[PREWARM]: Reusing warm OpenAI session for call_id={call_id} - skipping cold connect")
+    else:
+        if prewarmed:
+            try:
+                await prewarmed["ws_cm"].__aexit__(None, None, None)
+            except Exception:
+                pass
+        ctx = await resolve_call_voice_context(db, call_id, company_id)
+        system_prompt = ctx["system_prompt"]
+        welcome_text = ctx["welcome_text"]
+        company = ctx["company"]
+        transcription_lang = ctx["transcription_lang"]
+
+    openai_key = os.environ.get("OPENAI_API_KEY", "").strip() or OPENAI_API_KEY
+    openai_ws_url = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
+    openai_headers = {"Authorization": f"Bearer {openai_key}"}
+
+    transcript_parts = []
+    stream_id = None
+    hangup_triggered = False
+    last_speech_stopped_time = None
+    customer_speaking = False
+    turn_rms_samples = []
+
+    async def trigger_auto_hangup(delay_seconds: float = 3.5):
+        nonlocal hangup_triggered
+        # Shield: Never hangup early if conversation has not even reached 3 turns
+        if hangup_triggered or len(transcript_parts) < 3:
+            safe_print(f"[AUTO HANGUP SHIELD]: Ignored hangup trigger (turns={len(transcript_parts)}, triggered={hangup_triggered}). Call remains active.")
+            return
+        hangup_triggered = True
+        turns_at_trigger = len(transcript_parts)
+        safe_print(f"[AUTO HANGUP]: Scheduled in {delay_seconds}s (turns={turns_at_trigger}) unless the conversation genuinely continues...")
+
+        # Poll instead of one long sleep: a goodbye can be wrongly detected
+        # (e.g. from a hallucinated/garbled transcript) and the model can keep
+        # talking afterward. If the transcript keeps growing after the
+        # goodbye was "said", that MIGHT be real continued conversation -
+        # but it might also just be background noise, a hallucinated
+        # fragment, or a trivial filler word ("Hello.", "Thank you.", "you")
+        # picked up during the wrap-up window. Cancelling on ANY growth
+        # caused exactly that: a call that had already concluded kept
+        # getting reopened by noise, leaving the model confused with no
+        # real next step and no clean way to end the call. Only a
+        # substantial new customer utterance (3+ words) is treated as a
+        # genuine reason to keep the call alive; the AI's own residual
+        # output never cancels a hangup it already decided on.
+        waited = 0.0
+        poll_interval = 1.0
+        while waited < delay_seconds:
+            await asyncio.sleep(poll_interval)
+            waited += poll_interval
+            new_entries = transcript_parts[turns_at_trigger:]
+            substantial_continuation = next(
+                (e for e in new_entries
+                 if e.startswith("Customer:") and len(e[len("Customer:"):].strip().split()) >= 3),
+                None
+            )
+            if substantial_continuation:
+                safe_print(f"[AUTO HANGUP]: Cancelled - substantial customer continuation: '{substantial_continuation}'")
+                hangup_triggered = False
+                return
+
+        try:
+            cdoc = await db.calls.find_one({"call_id": call_id}) if call_id else None
+            call_uuid = (cdoc.get("plivo_call_uuid") or cdoc.get("plivo_request_uuid")) if cdoc else None
+            company_telephony = company.get("telephony", {}) if company else {}
+            plivo_auth_id = company_telephony.get("account_sid") or os.environ.get("PLIVO_AUTH_ID")
+            plivo_auth_token = company_telephony.get("auth_token") or os.environ.get("PLIVO_AUTH_TOKEN")
+            if call_uuid and plivo_auth_id and plivo_auth_token:
+                plivo_prov = PlivoProvider(plivo_auth_id, plivo_auth_token)
+                await plivo_prov.hangup_call(call_uuid)
+                safe_print(f"[AUTO HANGUP]: Plivo call {call_uuid} hung up successfully via REST API.")
+            await websocket.close()
+        except Exception as hg_e:
+            safe_print(f"[AUTO HANGUP ERROR]: {hg_e}")
+
+    ws_cm = None
+    openai_ws = None
+
+    try:
+        if prewarmed_usable:
+            # Session already connected and configured by prewarm_openai_session
+            # at /answer time - nothing left to do but trigger the greeting.
+            ws_cm = prewarmed["ws_cm"]
+            openai_ws = prewarmed["openai_ws"]
+        else:
+            # Cold path (no usable pre-warmed session): connect now.
+            ws_cm = websockets.connect(openai_ws_url, additional_headers=openai_headers)
+            openai_ws = await ws_cm.__aenter__()
+            logger.info("Connected to OpenAI Realtime API WebSocket")
+
+            # Receive session.created
+            init_event = await openai_ws.recv()
+
+            # Update session: interrupt_response is True, protected during greeting by plivo_to_openai shield
+            session_update = _openai_session_update_payload(system_prompt, transcription_lang)
+            await openai_ws.send(json.dumps(session_update))
+
+        # Brief shield so the click/pop from the line connecting isn't fed to
+        # the transcriber as speech. Kept short on purpose: genuine early
+        # speech (e.g. the customer saying "hello?" right as the greeting
+        # starts) must still reach OpenAI so it's transcribed and can barge in.
+        pickup_click_shield_until = time.time() + 0.5
+
+        # Trigger immediate opening greeting verbatim
+        greet_prompt = f"Speak the following opening greeting verbatim right now: \"{welcome_text}\""
+        trigger_greeting = {
+            "type": "response.create",
+            "response": {
+                "instructions": greet_prompt
+            }
+        }
+        await openai_ws.send(json.dumps(trigger_greeting))
+
+        async def plivo_to_openai():
+            nonlocal stream_id, turn_rms_samples
+            try:
+                while True:
+                    raw_msg = await websocket.receive_text()
+                    data = json.loads(raw_msg)
+                    event_type = data.get("event")
+
+                    if event_type == "start":
+                        stream_id = data.get("start", {}).get("streamId") or data.get("streamId")
+                        logger.info(f"Plivo Stream started: streamId={stream_id}")
+
+                    elif event_type == "media":
+                        media_data = data.get("media", {})
+                        payload = media_data.get("payload") or data.get("payload")
+                        if payload and isinstance(payload, str):
+                            # Only swallow the brief line-pickup click, not the whole greeting
+                            if time.time() < pickup_click_shield_until:
+                                continue
+                            if customer_speaking:
+                                # Track this turn's raw audio energy (mu-law -> linear PCM
+                                # RMS) so speech_stopped can tell real speech apart from
+                                # near-silence/background noise before trusting whatever
+                                # transcript Whisper hands back for it.
+                                try:
+                                    lin = audioop.ulaw2lin(base64.b64decode(payload), 2)
+                                    turn_rms_samples.append(audioop.rms(lin, 2))
+                                except Exception:
+                                    pass
+                            audio_append = {
+                                "type": "input_audio_buffer.append",
+                                "audio": payload
+                            }
+                            await openai_ws.send(json.dumps(audio_append))
+
+                    elif event_type == "stop":
+                        logger.info("Plivo stream stop received")
+                        break
+            except WebSocketDisconnect:
+                logger.info("Plivo client disconnected")
+            except Exception as e:
+                logger.error(f"Error in plivo_to_openai: {e}")
+
+        async def openai_to_plivo():
+            nonlocal stream_id, last_speech_stopped_time, customer_speaking, turn_rms_samples
+            try:
+                while True:
+                    msg = await openai_ws.recv()
+                    event = json.loads(msg)
+                    etype = event.get("type")
+
+                    # Both GA ('response.output_audio.delta') and Beta ('response.audio.delta')
+                    if etype in ("response.output_audio.delta", "response.audio.delta"):
+                        delta = event.get("delta")
+                        if delta:
+                            if last_speech_stopped_time is not None:
+                                turn_lat_ms = int((time.time() - last_speech_stopped_time) * 1000)
+                                safe_print(f"[LATENCY METRIC]: First audio chunk arrived in {turn_lat_ms}ms!")
+                                last_speech_stopped_time = None
+
+                            play_msg = {
+                                "event": "playAudio",
+                                "media": {
+                                    "contentType": "audio/x-mulaw",
+                                    "sampleRate": 8000,
+                                    "payload": delta
+                                }
+                            }
+                            await websocket.send_text(json.dumps(play_msg))
+
+                    elif etype == "input_audio_buffer.speech_started":
+                        if time.time() < pickup_click_shield_until:
+                            continue
+                        safe_print("[VAD]: Customer started speaking! Clearing audio buffer on Plivo...")
+                        await websocket.send_text(json.dumps({"event": "clearAudio"}))
+                        customer_speaking = True
+                        turn_rms_samples = []
+
+                    elif etype == "input_audio_buffer.speech_stopped":
+                        last_speech_stopped_time = time.time()
+                        customer_speaking = False
+                        avg_rms = (sum(turn_rms_samples) / len(turn_rms_samples)) if turn_rms_samples else None
+                        energy_note = f" [AUDIO ENERGY]: avg_rms={avg_rms:.0f}" if avg_rms is not None else ""
+                        safe_print(f"[VAD]: Customer stopped speaking. Processing response...{energy_note}")
+
+                        # Whisper fabricates fluent, unrelated text ("I love you all",
+                        # "thanks for watching") when fed near-silent/low-energy audio
+                        # instead of returning nothing - a well-documented failure mode
+                        # that no amount of prompt tuning fixes, since the model has no
+                        # way to know the transcript it's acting on was invented. Catch
+                        # it at the source: if THIS turn's actual audio was too quiet to
+                        # plausibly be real speech, cancel whatever response the server's
+                        # auto-VAD just triggered and ask the customer to repeat instead
+                        # of letting the agent act on a transcript we already distrust.
+                        if avg_rms is not None and avg_rms < SILENCE_RMS_THRESHOLD:
+                            safe_print(f"[SILENCE GATE]: avg_rms={avg_rms:.0f} < {SILENCE_RMS_THRESHOLD} threshold - treating as silence/noise, not speech. Cancelling auto-response.")
+                            try:
+                                await openai_ws.send(json.dumps({"type": "response.cancel"}))
+                            except Exception:
+                                pass
+                            clarify_prompt = (
+                                "The audio just received was silent or near-silent background "
+                                "noise, not an intelligible answer from the customer. Do NOT "
+                                "guess, assume, or act on any transcript from it. In whichever "
+                                "language you've been using, briefly and politely ask the "
+                                "customer to repeat what they said, and ask nothing else this turn."
+                            )
+                            try:
+                                await openai_ws.send(json.dumps({
+                                    "type": "response.create",
+                                    "response": {"instructions": clarify_prompt}
+                                }))
+                            except Exception as e:
+                                safe_print(f"[SILENCE GATE ERROR]: Failed to send corrective response: {e}")
+
+                    elif etype in ("response.output_audio_transcript.done", "response.audio_transcript.done", "response.done"):
+                        text = event.get("transcript", "").strip()
+                        if text:
+                            safe_print(f"[AI SPEECH]: {text}")
+                            transcript_parts.append(f"AI: {text}")
+                            if call_id:
+                                try:
+                                    await db.calls.update_one(
+                                        {"call_id": call_id},
+                                        {"$set": {"transcript": "\n".join(transcript_parts)}}
+                                    )
+                                except Exception as db_e:
+                                    safe_print(f"Error persisting transcript: {db_e}")
+
+                            # Detect goodbye phrases in AI speech to auto hangup with dynamic speaking duration
+                            text_lower = text.lower()
+                            goodbye_keywords = [
+                                "अलविदा", "दिन शुभ हो", "बाय", "bye", "goodbye",
+                                "have a great day", "have a wonderful day", "have a good day",
+                                "take care", "बात करने के लिए धन्यवाद"
+                            ]
+                            # -1 because this AI line was just appended above -
+                            # without it, a short greeting -> one reply ->
+                            # goodbye sequence always self-satisfies "3 turns"
+                            # using the goodbye line itself as the 3rd turn.
+                            if (len(transcript_parts) - 1) >= 3 and any(kw in text_lower for kw in goodbye_keywords):
+                                chars = len(text.strip())
+                                delay = max(7.0, min((chars / 11.0) + 3.5, 16.0))
+                                safe_print(f"[AUTO HANGUP]: Goodbye detected in AI speech. Allowing full sentence to complete ({delay:.1f}s)...")
+                                asyncio.create_task(trigger_auto_hangup(delay_seconds=delay))
+
+                    elif etype in ("conversation.item.input_audio_transcription.completed", "input_audio_transcription.completed"):
+                        text = event.get("transcript", "").strip()
+                        if text and text.lower() not in HALLUCINATION_PHRASES and len(text) > 1:
+                            if not any(text == p.replace("Customer: ", "").strip() for p in transcript_parts):
+                                safe_print(f"[CUSTOMER SPEECH]: {text}")
+                                transcript_parts.append(f"Customer: {text}")
+                                if call_id:
+                                    try:
+                                        await db.calls.update_one(
+                                            {"call_id": call_id},
+                                            {"$set": {"transcript": "\n".join(transcript_parts)}}
+                                        )
+                                    except Exception as db_e:
+                                        safe_print(f"Error persisting customer transcript: {db_e}")
+
+                    elif etype == "conversation.item.created":
+                        item = event.get("item", {})
+                        if item.get("role") == "user":
+                            for c in item.get("content", []):
+                                if c.get("type") == "input_text" and c.get("text"):
+                                    ctext = c["text"].strip()
+                                    if ctext and ctext.lower() not in HALLUCINATION_PHRASES and len(ctext) > 1:
+                                        if not any(ctext == p.replace("Customer: ", "").strip() for p in transcript_parts):
+                                            safe_print(f"[CUSTOMER SPEECH via ITEM]: {ctext}")
+                                            transcript_parts.append(f"Customer: {ctext}")
+                                            if call_id:
+                                                try:
+                                                    await db.calls.update_one(
+                                                        {"call_id": call_id},
+                                                        {"$set": {"transcript": "\n".join(transcript_parts)}}
+                                                    )
+                                                except Exception:
+                                                    pass
+
+
+                    elif etype == "response.function_call_arguments.done" and event.get("name") == "end_call":
+                        call_id_func = event.get("call_id")
+                        has_goodbye = any(
+                            any(kw in p.lower() for kw in ["अलविदा", "दिन शुभ हो", "बाय", "bye", "goodbye", "तय कर दिया गया", "कन्फर्म हो गया", "कन्फर्म कर दिया"])
+                            for p in transcript_parts if p.startswith("AI:")
+                        )
+                        if (len(transcript_parts) - 1) < 3 or not has_goodbye:
+                            safe_print(f"[AUTO HANGUP SHIELD]: Premature end_call blocked (turns={len(transcript_parts)}, has_goodbye={has_goodbye}). Continuing conversation...")
+                            if call_id_func:
+                                func_resp = {
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "type": "function_call_output",
+                                        "call_id": call_id_func,
+                                        "output": json.dumps({"status": "continue", "message": "Call is active. Continue the conversation and ask the next question from key objectives."})
+                                    }
+                                }
+                                await openai_ws.send(json.dumps(func_resp))
+                            await openai_ws.send(json.dumps({"type": "response.create"}))
+                        else:
+                            safe_print(f"[AUTO HANGUP]: Confirmation and goodbye verified in speech. Ending call in 8s ({event.get('arguments')})...")
+                            asyncio.create_task(trigger_auto_hangup(delay_seconds=8.0))
+
+                    elif etype == "conversation.item.created" and event.get("item", {}).get("name") == "end_call":
+                        has_goodbye = any(
+                            any(kw in p.lower() for kw in ["अलविदा", "दिन शुभ हो", "बाय", "bye", "goodbye", "तय कर दिया गया", "कन्फर्म हो गया", "कन्फर्म कर दिया"])
+                            for p in transcript_parts if p.startswith("AI:")
+                        )
+                        if has_goodbye and (len(transcript_parts) - 1) >= 3:
+                            safe_print("[AUTO HANGUP]: OpenAI created function call end_call with verified goodbye")
+                            asyncio.create_task(trigger_auto_hangup(delay_seconds=8.0))
+
+
+                    elif etype == "error":
+                        safe_print(f"[OPENAI REALTIME ERROR]: {event.get('error')}")
+
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                safe_print(f"Error in openai_to_plivo: {e}")
+
+        # Run both streaming tasks concurrently until either terminates
+        t1 = asyncio.create_task(plivo_to_openai())
+        t2 = asyncio.create_task(openai_to_plivo())
+        done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+        for p in pending:
+            p.cancel()
+        for d in done:
+            tname = "plivo_to_openai" if d == t1 else "openai_to_plivo"
+            if d.exception():
+                safe_print(f"[STREAM TASK ERROR]: {tname} raised: {d.exception()}")
+            else:
+                safe_print(f"[STREAM TASK COMPLETED]: {tname} finished.")
+
+    except Exception as e:
+        safe_print(f"Realtime streaming session error: {e}")
+    finally:
+        safe_print(f"[STREAM FINALLY]: call_id={call_id}, turns recorded={len(transcript_parts)}")
+        await finalize_plivo_call(call_id, company_id=company_id, transcript_parts=transcript_parts)
+        if ws_cm:
+            try:
+                await ws_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+@plivo_router.api_route("/hangup", methods=["GET", "POST"])
+async def plivo_hangup_handler(request: Request, call_id: str = Query(None), company_id: str = Query(None)):
+    """Called by Plivo when the call ends."""
+    if request.method == "POST":
+        try:
+            form_data = await request.form()
+            data = dict(form_data)
+        except Exception:
+            data = dict(request.query_params)
+    else:
+        data = dict(request.query_params)
+    duration = int(data.get("Duration", 0) or data.get("BillDuration", 0))
+    hangup_cause = data.get("HangupCause", "Normal")
+    call_uuid = data.get("CallUUID")
+
+    # call_id only ever arrives via query param for outbound calls, where
+    # trigger_outbound_call() built it into the hangup_url it gave Plivo.
+    # If a hangup URL is ever configured statically (e.g. on a Plivo
+    # Application, for inbound), it can't carry that param - fall back to
+    # looking the call up by Plivo's own CallUUID, which every hangup
+    # callback includes regardless.
+    if not call_id and call_uuid:
+        db = mongodb.get_db()
+        match = await db.calls.find_one({"plivo_call_uuid": call_uuid})
+        if match:
+            call_id = match.get("call_id")
+            company_id = company_id or match.get("company_id")
+
+    logger.info(f"Plivo Call Ended: call_id={call_id}, duration={duration}s, cause={hangup_cause}")
+
+    await finalize_plivo_call(
+        call_id=call_id,
+        company_id=company_id,
+        duration=duration,
+        hangup_cause=hangup_cause
+    )
+
+    return {"status": "success"}
+
+
+@plivo_router.get("/available-numbers")
+async def search_plivo_numbers(
+    country: str = Query("IN"),
+    city: str = Query(None),
+    limit: int = Query(10),
+    current_user: dict = Depends(require_company_access)
+):
+    """Search available phone numbers from Plivo that any company can buy."""
+    db = mongodb.get_db()
+    company = await db.companies.find_one({"company_id": current_user["company_id"]})
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    telephony = company.get("telephony") or {}
+    auth_id = telephony.get("account_sid") or os.environ.get("PLIVO_AUTH_ID")
+    auth_token = telephony.get("auth_token") or os.environ.get("PLIVO_AUTH_TOKEN")
+
+    if not auth_id or not auth_token:
+        raise HTTPException(status_code=503, detail="Plivo master credentials are not configured on this server (set PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN)")
+
+    provider = PlivoProvider(auth_id, auth_token)
+    numbers = await provider.search_numbers(country_iso=country, city=city, limit=limit)
+    return {"status": "success", "numbers": numbers}
+
+
+@plivo_router.post("/buy-number")
+async def buy_plivo_number(
+    payload: dict = Body(...),
+    current_user: dict = Depends(require_company_access)
+):
+    """Buy a dedicated phone number from Plivo for this company."""
+    phone_number = payload.get("phone_number")
+    if not phone_number:
+        raise HTTPException(status_code=400, detail="phone_number is required")
+
+    db = mongodb.get_db()
+    company = await db.companies.find_one({"company_id": current_user["company_id"]})
+    telephony = company.get("telephony") or {}
+
+    auth_id = telephony.get("account_sid") or os.environ.get("PLIVO_AUTH_ID")
+    auth_token = telephony.get("auth_token") or os.environ.get("PLIVO_AUTH_TOKEN")
+    if not auth_id or not auth_token:
+        raise HTTPException(status_code=503, detail="Plivo master credentials are not configured on this server (set PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN)")
+
+    provider = PlivoProvider(auth_id, auth_token)
+    result = await provider.buy_number(phone_number)
+
+    if result.get("status") == "success":
+        clean_num = "+" + phone_number.replace("+", "").replace(" ", "").replace("-", "")
+        # Update company record
+        await db.companies.update_one(
+            {"company_id": current_user["company_id"]},
+            {"$set": {
+                "telephony.mode": "custom",
+                "telephony.provider": "plivo",
+                "telephony.phone_number": clean_num,
+                "telephony.account_sid": auth_id,
+                "telephony.auth_token": auth_token,
+                "telephony.connected_at": datetime.utcnow().isoformat()
+            }}
+        )
+        # Upsert registry
+        await db.phone_numbers.update_one(
+            {"phone_number": clean_num},
+            {"$set": {
+                "phone_number": clean_num,
+                "company_id": current_user["company_id"],
+                "provider": "plivo",
+                "status": "active",
+                "updated_at": datetime.utcnow()
+            }},
+            upsert=True
+        )
+
+    return result

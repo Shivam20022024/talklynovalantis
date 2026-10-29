@@ -6,13 +6,16 @@ import { usePathname, useRouter } from 'next/navigation';
 import {
   Activity,
   BarChart3,
+  Bell,
   Bot,
   Building2,
   ChevronDown,
+  Flame,
   Home,
   LogOut,
   Menu,
   Phone,
+  PhoneIncoming,
   Search,
   Settings2,
   ShieldCheck,
@@ -37,6 +40,7 @@ const COMPANY_ADMIN_NAV: NavGroup[] = [
       ['Leads', Users, '/leads'],
       ['Campaigns', Target, '/campaigns'],
       ['Calls', Phone, '/calls'],
+      ['Inbound Calls', PhoneIncoming, '/inbound-calls'],
       ['AI Prompt', Bot, '/prompt'],
       ['Agent', Activity, '/agent'],
       ['Voice Intelligence', Activity, '/voice-intelligence'],
@@ -128,6 +132,113 @@ function HeaderAvatarMenu() {
             >
               <LogOut size={15} />Log out
             </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function timeAgo(iso: string): string {
+  if (!iso) return '';
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
+function NotificationBell() {
+  const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const [notifications, setNotifications] = useState<any[]>([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+
+  const load = async () => {
+    try {
+      const data = await fetchApi('/api/v1/notifications?limit=15');
+      setNotifications(data?.notifications || []);
+      setUnreadCount(data?.unread_count || 0);
+    } catch {
+      // Silent - notifications are a convenience, not critical path.
+    }
+  };
+
+  useEffect(() => {
+    load();
+    const interval = setInterval(load, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleOpenNotification = async (n: any) => {
+    try {
+      await fetchApi(`/api/v1/notifications/${n.id}/read`, { method: 'POST' });
+    } catch {}
+    setNotifications((prev) => prev.map((x) => (x.id === n.id ? { ...x, read: true } : x)));
+    setUnreadCount((c) => Math.max(0, c - (n.read ? 0 : 1)));
+    setOpen(false);
+    if (n.call_id) router.push(`/leads`);
+  };
+
+  const handleMarkAllRead = async () => {
+    try {
+      await fetchApi('/api/v1/notifications/read-all', { method: 'POST' });
+      setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+      setUnreadCount(0);
+    } catch {}
+  };
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="relative flex h-9 w-9 items-center justify-center rounded-lg border border-border bg-background text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+        aria-label="Notifications"
+      >
+        <Bell size={16} />
+        {unreadCount > 0 && (
+          <span className="absolute -right-1 -top-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-destructive px-1 text-[9px] font-bold text-white">
+            {unreadCount > 9 ? '9+' : unreadCount}
+          </span>
+        )}
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div className="absolute right-0 z-50 mt-2 w-80 max-h-[70vh] overflow-y-auto rounded-lg border border-border bg-card shadow-xl">
+            <div className="flex items-center justify-between border-b border-border px-3.5 py-2.5">
+              <span className="text-xs font-bold text-foreground">Lead Alerts</span>
+              {unreadCount > 0 && (
+                <button onClick={handleMarkAllRead} className="text-[11px] font-semibold text-primary hover:underline">
+                  Mark all read
+                </button>
+              )}
+            </div>
+            {notifications.length === 0 ? (
+              <div className="px-4 py-8 text-center text-xs text-muted-foreground">
+                No alerts yet - you'll see leads here as soon as they go Qualified or Converted.
+              </div>
+            ) : (
+              notifications.map((n) => (
+                <button
+                  key={n.id}
+                  onClick={() => handleOpenNotification(n)}
+                  className={`flex w-full items-start gap-2.5 border-b border-border/50 px-3.5 py-3 text-left last:border-0 hover:bg-muted/50 ${!n.read ? 'bg-primary/5' : ''}`}
+                >
+                  <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400">
+                    <Flame size={13} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-xs font-bold text-foreground">{n.title}</p>
+                    <p className="mt-0.5 line-clamp-2 text-[11px] text-muted-foreground">{n.message}</p>
+                    <p className="mt-1 text-[10px] text-muted-foreground">{timeAgo(n.created_at)}</p>
+                  </div>
+                  {!n.read && <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />}
+                </button>
+              ))
+            )}
           </div>
         </>
       )}
@@ -327,6 +438,7 @@ export default function AppLayout({ children, title = 'Dashboard' }: { children:
               <button onClick={() => setSearchOpen(true)} className="hidden items-center gap-2 rounded-lg border border-border bg-background px-3 py-2 text-xs text-muted-foreground sm:flex hover:bg-muted transition-colors">
                 <Search size={14} />Search…
               </button>
+              {!isSuperAdmin && <NotificationBell />}
               <HeaderAvatarMenu />
             </div>
           </header>

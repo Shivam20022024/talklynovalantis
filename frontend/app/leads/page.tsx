@@ -123,7 +123,8 @@ function LeadsContent() {
           phone_number: quickCallNumber,
           customer_name: quickCallName.trim(),
           lead_id: 'quick-call-' + Date.now(),
-          campaign_language: 'English'
+          campaign_language: 'English',
+          industry: activeIndustry === 'all' ? (user?.industry || 'general_sales') : activeIndustry
         })
       })
       alert(`Call dispatched successfully to ${quickCallName.trim()}!`)
@@ -196,7 +197,10 @@ function LeadsContent() {
           phone_number: lead.phone,
           customer_name: lead.name,
           lead_id: lead.lead_id || 'manual-lead',
-          campaign_language: 'English'
+          campaign_language: 'English',
+          industry: lead.industry || 'general_sales',
+          offering: lead.offering || lead.property || '',
+          location: lead.location || ''
         })
       })
       alert('Call dispatched successfully!')
@@ -341,8 +345,8 @@ function LeadsContent() {
               ) : visibleLeads.length === 0 ? (
                 <tr><td colSpan={8} className="py-8 text-center text-sm text-muted-foreground">No leads found.</td></tr>
               ) : (
-                visibleLeads.map((lead) => (
-                  <tr key={lead.lead_id} className="border-b border-border/70 last:border-0 hover:bg-muted/30">
+                visibleLeads.map((lead, idx) => (
+                  <tr key={`${lead._id || lead.lead_id || 'lead'}-${idx}`} className="border-b border-border/70 last:border-0 hover:bg-muted/30">
                     <td className="py-4 pl-4">
                       <input 
                         type="checkbox" 
@@ -588,14 +592,15 @@ function LeadsContent() {
                   ) : selectedCall && selectedCall.transcript ? (
                     <div className="flex flex-col space-y-3">
                       {selectedCall.transcript.split('\n').filter((l: string) => l.trim().length > 0).map((line: string, i: number) => {
-                        const isUser = line.toLowerCase().startsWith('user:');
-                        const isAssistant = line.toLowerCase().startsWith('assistant:');
+                        const lower = line.toLowerCase();
+                        const isUser = lower.startsWith('user:') || lower.startsWith('customer:') || lower.startsWith('caller:');
+                        const isAssistant = lower.startsWith('assistant:') || lower.startsWith('ai:') || lower.startsWith('agent:');
                         
                         if (!isUser && !isAssistant) {
                           return <div key={i} className="text-xs text-center text-muted-foreground/70 my-2">{line}</div>;
                         }
                         
-                        const content = line.replace(/^(user:|assistant:)\s*/i, '');
+                        const content = line.replace(/^(user:|customer:|caller:|assistant:|ai:|agent:)\s*/i, '');
                         
                         return (
                           <div key={i} className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
