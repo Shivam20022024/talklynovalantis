@@ -117,6 +117,12 @@ class BillingService:
         (trial or not) needs a positive wallet balance once that runs out -
         no company could be blocked by insufficient funds before this."""
         company = await db.companies.find_one({"company_id": company_id})
+
+        # Internal/demo companies on the "unlimited" plan are never metered -
+        # always allowed, regardless of trial status or wallet balance.
+        if company and company.get("plan_type") == "unlimited":
+            return {"allowed": True, "reason": "unlimited_plan"}
+
         is_trial = not company or company.get("plan_type") == "trial"
 
         if is_trial:
@@ -161,6 +167,7 @@ class BillingService:
 
             billable_seconds = duration_seconds
             company = await db.companies.find_one({"company_id": company_id})
+            is_unlimited = bool(company) and company.get("plan_type") == "unlimited"
             is_trial = not company or company.get("plan_type") == "trial"
             if is_trial:
                 used_so_far = await self.get_trial_seconds_used(db, company_id)
@@ -168,7 +175,9 @@ class BillingService:
                 free_seconds_applied = min(duration_seconds, free_remaining)
                 billable_seconds = duration_seconds - free_seconds_applied
 
-            customer_cost = round(billable_seconds * (pricing["customer_price"] / 60.0), 2)
+            # Unlimited companies: still logged below for usage visibility,
+            # just never charged.
+            customer_cost = 0.0 if is_unlimited else round(billable_seconds * (pricing["customer_price"] / 60.0), 2)
 
         # Check active subscription first
         subscription = await db.company_subscriptions.find_one({
@@ -223,8 +232,14 @@ class BillingService:
         
         # Check company info and trial status
         company = await db.companies.find_one({"company_id": company_id})
+        is_unlimited = bool(company) and company.get("plan_type") == "unlimited"
         is_trial = not company or company.get("plan_type") == "trial"
-        plan_name = "Free Trial Starter" if is_trial else company.get("plan_type", "Pay-As-You-Go")
+        if is_unlimited:
+            plan_name = "Unlimited (Internal)"
+        elif is_trial:
+            plan_name = "Free Trial Starter"
+        else:
+            plan_name = company.get("plan_type", "Pay-As-You-Go")
         included_minutes = TRIAL_FREE_SECONDS / 60.0 if is_trial else 0
         
         # Active Plan subscription if any
