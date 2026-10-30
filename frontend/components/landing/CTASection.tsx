@@ -75,7 +75,7 @@ export const CTASection = ({ onStart }: { onStart?: () => void }) => {
           transition={{ duration: 0.8, delay: 0.4 }}
           className="flex flex-wrap justify-center items-center gap-x-6 gap-y-2"
         >
-          {['No credit card required', 'Free 14-day trial', 'Setup in 5 minutes'].map((text, i) => (
+          {['No credit card required', '10 free AI calling minutes', 'Setup in 5 minutes'].map((text, i) => (
             <span key={i} className="flex items-center gap-2 text-xs text-gray-400 dark:text-gray-600 font-medium">
               <span className="w-1 h-1 rounded-full bg-theme-300 dark:bg-brand-primary/30" />
               {text}
