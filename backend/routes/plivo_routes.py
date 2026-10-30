@@ -363,6 +363,17 @@ async def resolve_call_voice_context(db, call_id: str, company_id: str = None) -
         "- LANGUAGE MIRRORING: Always match the language the customer is actually using, turn by turn - do not stay locked to your opening greeting's language. If they reply in English, continue in English (with your Indian English accent). If they speak Hindi or code-mixed Hinglish, respond in natural Hindi/Hinglish. If they explicitly ask for Hindi ('हिंदी में बात करो') or ask for English, switch immediately. If the customer has replied in English for the last two turns, keep speaking English even if your earlier turns were in Hindi.\n\n"
     )
 
+    natural_speech_directive = (
+        "\n\nNATURAL HUMAN CONVERSATION STYLE:"
+        "\n- Talk like a real person on a phone call, not someone reading a script. Short, warm, everyday phrasing beats long formal sentences."
+        "\n- Keep acknowledgements brief and natural: 'Great, thanks!', 'Sure, no problem', 'Got it', 'Perfect' - not stiff transitions like 'Thank you for that information.'"
+        "\n- Ask ONE short, plain question at a time. Prefer 'What exactly are you looking for?' over a long compound sentence like 'Could you tell me a bit more about what you're looking for in the program, or any specific questions you have? That way I can assist you better.'"
+        "\n- Use natural contractions (I'm, you're, that's, don't, can't, we'll) instead of full formal forms."
+        "\n- React briefly to what the customer just said before moving on - a quick 'Oh nice', 'I see', 'Makes sense', 'Okay cool' shows you're actually listening, instead of jumping straight to your next scripted point."
+        "\n- Vary how you start each turn. Don't open every single turn the same way (e.g. always 'Could you tell me...' or always 'I understand...') - mix it up the way a real person would."
+        "\n- Never sound like a call-center script, an email, or a formal announcement being read aloud. This is a live, warm, human conversation between two people."
+    )
+
     conversation_rules = (
         "\n\nCRITICAL CONVERSATIONAL & REJECTION RULES:"
         "\n1. ACCENT: Maintain your authentic, polite Indian English accent consistently across every single turn. Do not drift into an American accent."
@@ -381,7 +392,7 @@ async def resolve_call_voice_context(db, call_id: str, company_id: str = None) -
         "\n6. AUTOMATIC HANGUP: Immediately after concluding your goodbye, invoke the end_call function."
         "\n7. HANDLE UNCLEAR INPUT: If what the customer said does not logically fit the conversation, sounds garbled, or like background noise rather than a real answer, DO NOT guess or respond as if you understood it. This includes a random name, place, or short phrase with no logical connection to the question you just asked (e.g. you asked for a day/time and the answer is an unrelated proper noun) - NEVER interpret that as agreement, enthusiasm, or a valid choice. Politely ask them to repeat instead - Hindi: 'माफ कीजिए, क्या आप फिर से बता सकते हैं?' / English: 'Sorry, could you repeat that?' Only move forward once you get a clear, relevant answer to your last question. (Note: a coherent but off-topic remark is covered by rule 3, not this rule.)"
     )
-    system_prompt = indian_accent_directive + system_prompt + conversation_rules
+    system_prompt = indian_accent_directive + natural_speech_directive + system_prompt + conversation_rules
 
     safe_print(f"[STREAM PROMPT]: Industry={call_industry}, Welcome='{welcome_text}'")
 
